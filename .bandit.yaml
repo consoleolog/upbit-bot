@@ -1,0 +1,27 @@
+# Bandit 설정 파일
+# https://bandit.readthedocs.io/en/latest/config.html
+
+# 검사 대상 디렉토리
+targets:
+  - src
+
+# 검사 제외 디렉토리
+exclude_dirs:
+  - .venv
+  - .git
+  - tests
+  - dist
+  - build
+  - htmlcov
+
+# 최소 심각도 레벨: LOW | MEDIUM | HIGH
+# LOW = 모든 이슈 보고
+level: LOW
+
+# 최소 신뢰도 레벨: LOW | MEDIUM | HIGH
+confidence: LOW
+
+# 비활성화할 규칙 ID
+# https://bandit.readthedocs.io/en/latest/plugins/index.html
+skips:
+  - B101  # assert 구문 사용 허용 (테스트 코드 대응)
