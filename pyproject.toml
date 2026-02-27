@@ -5,3 +5,9 @@ description = "Python Starter Kit with Claude Code Action"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = []
+
+[dependency-groups]
+dev = [
+    # --- 코드 품질 ---
+    "ruff>=0.15.4",     # 린터 & 포매터
+]
