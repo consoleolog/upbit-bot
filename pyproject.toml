@@ -9,5 +9,6 @@ dependencies = []
 [dependency-groups]
 dev = [
     # --- 코드 품질 ---
-    "ruff>=0.15.4",     # 린터 & 포매터
+    "bandit>=1.9.4",
+    "ruff>=0.15.4", # 린터 & 포매터
 ]
