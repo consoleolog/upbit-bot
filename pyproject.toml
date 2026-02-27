@@ -1,0 +1,7 @@
+[project]
+name = "python-starter-kit"
+version = "0.1.0"
+description = "Python Starter Kit with Claude Code Action"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = []
