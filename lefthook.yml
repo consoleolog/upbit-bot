@@ -1,0 +1,18 @@
+pre-commit:
+  parallel: false
+  jobs:
+    - name: ruff-lint
+      glob: "*.py"
+      run: uv run ruff check {staged_files}
+
+    - name: ruff-format
+      glob: "*.py"
+      run: uv run ruff format --check {staged_files}
+
+    - name: bandit
+      glob: "*.py"
+      run: uv run bandit -q {staged_files}
+
+    - name: test
+      glob: "*.py"
+      run: uv run pytest --no-cov -n auto -q --no-header
