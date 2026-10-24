@@ -1,0 +1,15 @@
+on:
+  issues:
+    types: [ assigned ]    # Issue Assign 시 issue-branch.yml 규칙에 따라 브랜치 자동 생성
+
+jobs:
+  create_issue_branch_job:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write       # 브랜치 생성
+      issues: write         # Issue 댓글 작성
+    steps:
+      - name: Create Issue Branch
+        uses: robvanderleek/create-issue-branch@main
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

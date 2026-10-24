@@ -1,0 +1,21 @@
+# Environment
+.env
+.env.*
+!.env.example
+
+# IDE - JetBrains (IntelliJ, WebStorm, PyCharm, etc.)
+.idea/
+
+# IDE - VSCode
+.vscode/
+
+# OS - macOS
+.DS_Store
+
+# OS - Windows
+Thumbs.db
+Desktop.ini
+
+# Logs
+*.log
+logs/

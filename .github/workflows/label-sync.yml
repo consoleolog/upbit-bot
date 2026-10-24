@@ -1,0 +1,38 @@
+name: Label Sync
+
+on:
+  pull_request:
+    types: [opened, edited]
+
+jobs:
+  label-sync:
+    runs-on: ubuntu-latest
+    permissions:
+      issues: read
+      pull-requests: write
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const body = context.payload.pull_request.body || '';
+
+            // footer 에서 close/fix/resolve #<이슈번호> 파싱
+            const match = body.match(/(close|fix|resolve)[sd]?\s+#(\d+)/i);
+            if (!match) return;
+
+            const issueNumber = parseInt(match[2]);
+            const issue = await github.rest.issues.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issueNumber,
+            });
+
+            const labels = issue.data.labels.map(l => l.name);
+            if (labels.length === 0) return;
+
+            await github.rest.issues.addLabels({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+              labels,
+            });

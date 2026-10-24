@@ -1,0 +1,23 @@
+mode: auto
+branchName: ${issue.number}
+
+branches:
+  - label: hotfix
+    name: main
+    prefix: hotfix/main-
+
+  - label: enhancement
+    name: dev
+    prefix: feature/dev-
+
+  - label: setup
+    name: dev
+    prefix: feature/dev-
+
+  - label: bug
+    name: dev
+    prefix: feature/dev-
+
+  - label: refactor
+    name: dev
+    prefix: feature/dev-
