@@ -58,7 +58,7 @@ upbit-bot이 사용하는 PostgreSQL 스키마를 정리한 문서입니다.
 | **이력 없음**<br>모든 값을 덮어써서 언제, 어떤 신호로 매매했는지 남지 않음 | - `SIGNAL_HISTORY`: 지표 상태 변경을 트리거가 자동 기록<br>- `ORDERS`: 매매 사유(`reason`), 주문 시점 지표 상태(`signal_snapshot`)<br>- `POSITION`: 포지션별 결과와 사용한 설정(`config_id`) |
 | **포지션 정보 부족**<br>보유 수량·매입금액이 없어 평단가를 단순 평균으로 계산. 매수 횟수는 메모리에만 있음 | - `POSITION`에 매수·매도 수량, 금액, 수수료, 매수 횟수 누적<br>- 평단가 = `(bought_amount + buy_fee) / bought_volume` (수수료 포함 가중평균, 생성 컬럼) |
 | **주문 결과 없음**<br>주문 uuid, 체결가, 수수료를 저장하지 않아 주문 실패나 부분 체결을 알 수 없음 | - `ORDERS`: 업비트 uuid, 주문 상태, 수수료, 실패 사유<br>- `FILLS`: 체결 건별 가격·수량·금액 (부분 체결 포함) |
-| **제약 조건 없음**<br>재시작 시 중복 행, 상태 컬럼에 임의 문자열 가능 | PK, FK, UNIQUE, CHECK 지정<br>- 마켓 중복, 같은 체결 중복 저장 거부<br>- 열린 포지션은 마켓당 1개<br>- 주문 유형별 필수 값, 매도 수량 ≤ 매수 수량 |
+| **제약 조건 없음**<br>재시작 시 중복 행, 상태 컬럼에 임의 문자열 가능 | PK, FK, UNIQUE, CHECK 지정<br>- 마켓 중복, 같은 체결 중복 저장 거부<br>- 열린 포지션은 마켓당 1개<br>- 미완료 주문은 포지션당 1개<br>- 주문 유형별 필수 값, 매도 수량 ≤ 매수 수량 |
 | **구조 중복**<br>같은 구조의 지표를 테이블 3개로 나눠 쿼리와 코드가 중복됨 | `INDICATOR_INFO` 하나로 통합하고 `indicator_type`으로 구분 |
 | **값 컬럼의 시점**<br>`rsi`, `k_slow`, `d_slow`가 현재 값이 아니라 마지막 이벤트 시점의 값 | - `INDICATOR_INFO.value`, `signal`: 매 주기 갱신되는 현재 값<br>- `SIGNAL_HISTORY.value`, `signal`: 이벤트 시점의 값 |
 
@@ -209,7 +209,11 @@ UNIQUE 인덱스 `(market_id) WHERE status = 'OPEN'` — 열린 포지션은 마
 | `market` (시장가 매도) | `ask` | `requested_volume` > 0 |
 | `limit` (지정가) | `bid` / `ask` | `requested_volume` > 0, `limit_price` > 0 |
 
-인덱스: `(position_id)`, 미완료 주문 조회용 `(state) WHERE state IN ('pending', 'wait', 'watch')`
+인덱스
+
+- `(position_id)`
+- 미완료 주문 조회용 `(state) WHERE state IN ('pending', 'wait', 'watch')`
+- UNIQUE `(position_id) WHERE state IN ('pending', 'wait', 'watch')` — 미완료 주문은 포지션당 최대 1개. 같은 포지션에 주문이 동시에 두 번 기록되는 것을 막아 중복 주문을 방지
 
 ### 5.6 `FILLS`
 
