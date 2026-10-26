@@ -14,6 +14,7 @@ DEFAULT_SHUTDOWN_TIMEOUT = 10.0
 DEFAULT_CANCEL_TIMEOUT = 1.0
 
 Job = Callable[[], Awaitable[None]]
+Service = Callable[[], Awaitable[None]]
 
 
 class Application:
@@ -36,6 +37,14 @@ class Application:
         self._accepting = False
         self._market_locks: dict[str, asyncio.Lock] = {}
         self._tasks: set[asyncio.Task[None]] = set()
+        self._services: list[tuple[str, Service]] = []
+        self._service_tasks: list[asyncio.Task[None]] = []
+
+    def add_service(self, name: str, service: Service) -> None:
+        """실행하는 동안 함께 돌릴 백그라운드 작업(예: 스케줄러)을 등록한다. run() 전에만 등록할 수 있다."""
+        if self._accepting or self._stop_requested.is_set():
+            raise RuntimeError("services must be added before run()")
+        self._services.append((name, service))
 
     async def run(self) -> None:
         """종료 요청(stop 또는 SIGINT·SIGTERM)이 올 때까지 작업을 받아 처리한다."""
@@ -45,9 +54,15 @@ class Application:
         self._accepting = True
         logger.info("application started (config=%s)", self._config_path)
         try:
+            for name, service in self._services:
+                task = asyncio.create_task(service(), name=f"service:{name}")
+                task.add_done_callback(self._on_service_done)
+                self._service_tasks.append(task)
             await self._stop_requested.wait()
         finally:
             self._accepting = False
+            # 새 작업을 만드는 서비스를 먼저 멈춘 뒤, 이미 받은 작업을 정리한다
+            await self._stop_services()
             await self._drain_tasks()
             # 실행이 끝난 뒤에도 신호 처리기가 남아 있으면, 이후의 Ctrl+C가 이미 끝난 애플리케이션으로 전달된다
             for sig in STOP_SIGNALS:
@@ -84,6 +99,25 @@ class Application:
                 # 한 마켓의 실패가 다른 마켓과 애플리케이션을 멈추지 않도록 여기서 끊는다.
                 # 취소(CancelledError)는 Exception이 아니므로 잡지 않고 그대로 전달된다
                 logger.exception("job failed (market=%s)", market)
+
+    def _on_service_done(self, task: asyncio.Task[None]) -> None:
+        if task.cancelled():
+            return
+        # 서비스(스케줄러 등)가 멈추면 봇이 아무 일도 하지 않은 채 살아 있게 되므로, 애플리케이션을 종료한다
+        error = task.exception()
+        if error is not None:
+            logger.error("service %s failed; stopping application", task.get_name(), exc_info=error)
+        else:
+            logger.error("service %s exited unexpectedly; stopping application", task.get_name())
+        self.stop()
+
+    async def _stop_services(self) -> None:
+        for task in self._service_tasks:
+            task.cancel()
+        if self._service_tasks:
+            _, stuck = await asyncio.wait(self._service_tasks, timeout=self._cancel_timeout)
+            if stuck:
+                logger.error("%d service(s) did not stop after cancel; shutting down without them", len(stuck))
 
     async def _drain_tasks(self) -> None:
         """실행 중인 작업이 끝나기를 기다리고, 시간 안에 끝나지 않은 작업은 취소한다."""
