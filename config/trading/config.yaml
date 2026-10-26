@@ -1,0 +1,103 @@
+# ============================================================
+# Trading Bot 전체 설정
+# ============================================================
+
+# ────────────────────────────────────────────────────────────
+# 오케스트레이터
+# ────────────────────────────────────────────────────────────
+mode: DRY_RUN           # DRY_RUN | PAPER | LIVE
+
+markets:
+  - KRW-BTC
+  - KRW-ETH
+
+candle_types:
+  - candle.15m
+  - candle.30m
+  - candle.60m
+  - candle.240m
+
+# ────────────────────────────────────────────────────────────
+# PostgreSQL
+# ────────────────────────────────────────────────────────────
+database:
+  host: localhost
+  port: 5432
+  user: postgres
+  password: ""
+  database: trading_bot
+  # database_url: postgresql://postgres:password@localhost:5432/trading_bot  # 개별 항목 대신 URL로 지정 가능
+  pool_min: 10           # 최소 커넥션 풀 크기
+  pool_max: 20           # 최대 커넥션 풀 크기
+  max_queries: 50000     # 커넥션당 최대 쿼리 수 (초과 시 재생성)
+  connection_lifetime: 300  # 유휴 커넥션 유지 시간 (초)
+  command_timeout: 60    # 기본 명령 타임아웃 (초)
+
+# ────────────────────────────────────────────────────────────
+# Redis
+# ────────────────────────────────────────────────────────────
+redis:
+  host: localhost
+  port: 6379
+  database: 0
+  password: ""
+  max_connections: 50
+
+# ────────────────────────────────────────────────────────────
+# Upbit 거래소 어댑터
+# ────────────────────────────────────────────────────────────
+upbit:
+  api_key: ""            # 업비트 Open API Access Key
+  api_secret: ""         # 업비트 Open API Secret Key
+  is_test: true          # true: 테스트 주문 엔드포인트 사용 (/orders/test)
+
+# ────────────────────────────────────────────────────────────
+# 레짐 감지기 (RegimeDetector)
+# EMA 배열 정렬로 6가지 시장 국면 식별
+# ────────────────────────────────────────────────────────────
+regime_detector:
+  ema_short_period: 5    # 단기 EMA 기간
+  ema_mid_period: 20     # 중기 EMA 기간
+  ema_long_period: 40    # 장기 EMA 기간
+
+# ────────────────────────────────────────────────────────────
+# MACD·RSI·스토캐스틱 복합 전략
+# ────────────────────────────────────────────────────────────
+macd_rsi_stochastic_strategy:
+  # MACD (3밴드)
+  macd_upper_period: 3   # 상단 밴드 fast period
+  macd_mid_period: 5     # 중단 밴드 기준 period
+  macd_lower_period: 8   # 하단 밴드 slow period
+  macd_signal_period: 9  # MACD 시그널 라인 EMA 기간
+
+  # RSI
+  rsi_period: 14         # RSI 계산 기간
+  rsi_signal_period: 9   # RSI 시그널 라인 EMA 기간
+  rsi_overbought: 75     # 과매수 임계값
+  rsi_oversold: 25       # 과매도 임계값
+
+  # 스토캐스틱
+  stoch_k_len: 10        # Slow %K 계산 기간
+  stoch_k_smooth: 3      # Slow %K 스무딩
+  stoch_d_smooth: 3      # Slow %D 스무딩
+  stoch_overbought: 80   # 과매수 임계값
+  stoch_oversold: 20     # 과매도 임계값
+
+# ────────────────────────────────────────────────────────────
+# 컨플루언스 체커 (ConfluenceChecker)
+# ────────────────────────────────────────────────────────────
+confluence_checker:
+  min_signals: 6         # 거래 후보 생성에 필요한 최소 동일 방향 시그널 수
+
+# ────────────────────────────────────────────────────────────
+# 리스크 한도 (RiskLimitsConfig)
+# 모든 비율은 소수 기준 (예: 0.05 = 5%)
+# ────────────────────────────────────────────────────────────
+risk:
+  max_drawdown: 0.20           # 최대 허용 낙폭 — 초과 시 EMERGENCY_STOP
+  daily_loss_limit: 0.05       # 당일 최대 허용 손실 — 초과 시 FORCE_NO_ACTION
+  weekly_loss_limit: 0.10      # 주간 최대 허용 손실 — 초과 시 FORCE_NO_ACTION
+  max_position_size: 0.30      # 단일 포지션 최대 비중
+  max_risk_per_trade: 0.02     # 거래당 최대 리스크
+  max_positions: 5             # 동시 보유 최대 포지션 수
+  max_portfolio_exposure: 0.80 # 포트폴리오 최대 노출도
