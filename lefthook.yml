@@ -11,7 +11,7 @@ pre-commit:
 
     - name: bandit
       glob: "*.py"
-      run: uv run bandit -q {staged_files}
+      run: uv run bandit -q -c .bandit.yaml {staged_files}
 
     - name: test
       glob: "tests/**/test_*.py"
