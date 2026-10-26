@@ -265,3 +265,112 @@ async def test_stop_finishes_even_if_job_ignores_cancel() -> None:
     # 테스트가 끝난 뒤 남지 않도록 정리한다
     for job_task in asyncio.all_tasks() - {asyncio.current_task()}:
         job_task.cancel()
+
+
+async def test_service_runs_while_application_runs(capsys: pytest.CaptureFixture[str]) -> None:
+    app = Application(Path("config.json"))
+    started = asyncio.Event()
+
+    async def service() -> None:
+        print("hello world service")
+        started.set()
+        await asyncio.Event().wait()
+
+    app.add_service("hello", service)
+    task = await _start(app)
+    await _wait_all(started)
+    await _stop_and_wait(app, task)
+
+    assert "hello world service" in capsys.readouterr().out
+
+
+async def test_service_can_submit_jobs(capsys: pytest.CaptureFixture[str]) -> None:
+    app = Application(Path("config.json"))
+    done = asyncio.Event()
+
+    async def service() -> None:
+        app.submit("KRW-BTC", _hello("KRW-BTC", done))
+        await asyncio.Event().wait()
+
+    app.add_service("submitter", service)
+    task = await _start(app)
+    await _wait_all(done)
+    await _stop_and_wait(app, task)
+
+    assert "hello world KRW-BTC" in capsys.readouterr().out
+
+
+async def test_service_failure_stops_application() -> None:
+    app = Application(Path("config.json"))
+
+    async def broken() -> None:
+        raise RuntimeError("boom")
+
+    app.add_service("broken", broken)
+
+    await asyncio.wait_for(app.run(), STOP_TIMEOUT)
+
+
+async def test_service_exit_stops_application() -> None:
+    app = Application(Path("config.json"))
+
+    async def exits() -> None:
+        return None
+
+    app.add_service("exits", exits)
+
+    await asyncio.wait_for(app.run(), STOP_TIMEOUT)
+
+
+async def test_service_cancelled_on_stop() -> None:
+    app = Application(Path("config.json"))
+    cancelled = asyncio.Event()
+
+    async def service() -> None:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    app.add_service("waits", service)
+    task = await _start(app)
+    await asyncio.sleep(0)
+    await _stop_and_wait(app, task)
+
+    assert cancelled.is_set()
+
+
+async def test_add_service_after_run_rejected() -> None:
+    app = Application(Path("config.json"))
+    task = await _start(app)
+
+    async def service() -> None:
+        return None
+
+    with pytest.raises(RuntimeError, match="before run"):
+        app.add_service("late", service)
+    await _stop_and_wait(app, task)
+
+
+async def test_stop_finishes_even_if_service_ignores_cancel() -> None:
+    app = Application(Path("config.json"), cancel_timeout=0.01)
+    started = asyncio.Event()
+
+    async def ignores_cancel() -> None:
+        started.set()
+        try:
+            await asyncio.sleep(10)
+        except asyncio.CancelledError:
+            # 취소를 무시하고 계속 실행되는 서비스
+            await asyncio.sleep(10)
+
+    app.add_service("stubborn", ignores_cancel)
+    task = await _start(app)
+    await _wait_all(started)
+
+    await _stop_and_wait(app, task)
+
+    # 테스트가 끝난 뒤 남지 않도록 정리한다
+    for leftover in asyncio.all_tasks() - {asyncio.current_task()}:
+        leftover.cancel()
