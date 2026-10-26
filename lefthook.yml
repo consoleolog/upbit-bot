@@ -14,5 +14,5 @@ pre-commit:
       run: uv run bandit -q -c .bandit.yaml {staged_files}
 
     - name: test
-      glob: "tests/**/test_*.py"
+      glob: "tests/**test_*.py"
       run: uv run pytest {staged_files} --no-cov -n auto -q --no-header
