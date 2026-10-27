@@ -2,7 +2,7 @@ import asyncio
 from collections.abc import Callable
 from datetime import UTC, datetime
 from decimal import Decimal
-from typing import Any, Literal
+from typing import Any, Literal, Self
 
 import httpx
 
@@ -119,6 +119,13 @@ class UpbitClient:
         if self._http is not None:
             http, self._http = self._http, None
             await http.aclose()
+
+    async def __aenter__(self) -> Self:
+        await self.open()
+        return self
+
+    async def __aexit__(self, *exc_info: object) -> None:
+        await self.close()
 
     async def get_candles(
         self, market: str, timeframe: Timeframe, to: datetime, count: int = MAX_CANDLES

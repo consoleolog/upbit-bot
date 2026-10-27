@@ -443,3 +443,14 @@ async def test_get_candles_accepts_boundary_that_just_passed() -> None:
         assert await client.get_candles("KRW-BTC", Timeframe.MINUTE_30, TO) == []
     finally:
         await client.close()
+
+
+async def test_async_with_opens_and_closes() -> None:
+    client = UpbitClient(transport=httpx.MockTransport(lambda request: httpx.Response(200, json={"ok": True})))
+
+    async with client as opened:
+        assert opened is client
+        assert await client._request("GET", "/v1/test") == {"ok": True}
+
+    with pytest.raises(RuntimeError, match="not open"):
+        await client._request("GET", "/v1/test")
