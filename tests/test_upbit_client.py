@@ -9,6 +9,7 @@ import pytest
 
 from src.candle import KST, Candle
 from src.config import Timeframe
+from src.rate_limiter import RateLimiter
 from src.upbit_client import (
     Method,
     UpbitAuthError,
@@ -454,3 +455,20 @@ async def test_async_with_opens_and_closes() -> None:
 
     with pytest.raises(RuntimeError, match="not open"):
         await client._request("GET", "/v1/test")
+
+
+async def test_get_candles_waits_for_rate_limiter() -> None:
+    events: list[str] = []
+
+    class RecordingLimiter(RateLimiter):
+        async def acquire(self) -> None:
+            events.append("acquire")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        events.append("request")
+        return httpx.Response(200, json=[])
+
+    async with UpbitClient(transport=httpx.MockTransport(handler), candle_limiter=RecordingLimiter(1)) as client:
+        await client.get_candles("KRW-BTC", Timeframe.MINUTE_30, TO)
+
+    assert events == ["acquire", "request"]
