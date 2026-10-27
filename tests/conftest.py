@@ -2,6 +2,7 @@ import os
 from collections.abc import AsyncGenerator
 from pathlib import Path
 
+import asyncpg
 import httpx
 import pytest
 import pytest_asyncio
@@ -102,3 +103,18 @@ async def database(test_db_config: DatabaseConfig) -> AsyncGenerator[Database, N
         yield db
     finally:
         await db.close()
+
+
+class _RollbackError(Exception):
+    """테스트가 끝나면 트랜잭션을 롤백하기 위한 예외."""
+
+
+@pytest_asyncio.fixture
+async def conn(database: Database) -> AsyncGenerator[asyncpg.Connection, None]:
+    """테스트 DB 트랜잭션의 커넥션. 테스트가 끝나면 롤백해 데이터를 남기지 않는다."""
+    try:
+        async with database.transaction() as connection:
+            yield connection
+            raise _RollbackError
+    except _RollbackError:
+        pass
