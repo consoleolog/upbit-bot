@@ -1,7 +1,7 @@
 import pytest
 
-from src.indicators import Line
-from src.signals import CrossState, OverState, Threshold, cross, over
+from src.trading.indicators import Line
+from src.trading.signals import CrossState, OverState, Threshold, cross, over
 
 RSI = Threshold(over_sold=31, over_bought=60)
 

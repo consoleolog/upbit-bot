@@ -1,7 +1,7 @@
 from datetime import UTC, datetime
 from decimal import Decimal
 
-from src.candle import KST, Candle
+from src.exchange.candle import KST, Candle
 
 
 def test_start_kst_is_same_moment_in_korean_time() -> None:

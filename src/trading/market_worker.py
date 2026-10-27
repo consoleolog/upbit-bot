@@ -4,14 +4,14 @@ from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Protocol
 
-from src.application import Job
-from src.candle import Candle
-from src.config import Timeframe
-from src.database import Database
-from src.indicators import Indicators, IndicatorSettings, Line, calculate
+from src.app.application import Job
+from src.app.config import Timeframe
+from src.connections.database import Database
+from src.exchange.candle import Candle
 from src.repositories.indicator_info import IndicatorInfoRepository
 from src.repositories.models import IndicatorInfo, IndicatorType
-from src.signals import CrossState, SignalSettings, Threshold, cross, over
+from src.trading.indicators import Indicators, IndicatorSettings, Line, calculate
+from src.trading.signals import CrossState, SignalSettings, Threshold, cross, over
 
 logger = logging.getLogger(__name__)
 

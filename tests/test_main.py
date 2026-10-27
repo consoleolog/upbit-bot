@@ -4,9 +4,9 @@ from pathlib import Path
 import pytest
 from pytest_mock import MockerFixture
 
-from src.application import Application
-from src.config import Timeframe, TradingConfig
-from src.database import Database, DatabaseConfig
+from src.app.application import Application
+from src.app.config import Timeframe, TradingConfig
+from src.connections.database import Database, DatabaseConfig
 from src.main import EXIT_OK, EXIT_STARTUP_FAILED, main, parse_args, register_markets, run
 
 

@@ -7,10 +7,10 @@ from typing import Any
 import httpx
 import pytest
 
-from src.candle import KST, Candle
-from src.config import Timeframe
-from src.rate_limiter import RateLimiter
-from src.upbit_client import (
+from src.app.config import Timeframe
+from src.exchange.candle import KST, Candle
+from src.exchange.rate_limiter import RateLimiter
+from src.exchange.upbit_client import (
     Method,
     UpbitAuthError,
     UpbitBlockedError,

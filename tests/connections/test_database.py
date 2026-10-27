@@ -7,8 +7,8 @@ import asyncpg
 import pytest
 from pytest_mock import MockerFixture
 
-from src import database
-from src.database import Database, DatabaseConfig
+from src.connections import database
+from src.connections.database import Database, DatabaseConfig
 
 ENV = {
     "TEST_DB_HOST": "localhost",

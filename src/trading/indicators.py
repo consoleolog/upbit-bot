@@ -12,7 +12,7 @@ import numpy as np
 import talib
 from numpy.lib.stride_tricks import sliding_window_view
 
-from src.candle import Candle
+from src.exchange.candle import Candle
 
 Series = tuple[float | None, ...]
 

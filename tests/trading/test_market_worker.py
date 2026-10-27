@@ -7,11 +7,14 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from src.candle import Candle
-from src.config import Timeframe
-from src.database import Database
-from src.indicators import Indicators, IndicatorSettings, Line, calculate
-from src.market_worker import (
+from src.app.config import Timeframe
+from src.connections.database import Database
+from src.exchange.candle import Candle
+from src.repositories.indicator_info import IndicatorInfoRepository
+from src.repositories.market import MarketRepository
+from src.repositories.models import IndicatorInfo, IndicatorType
+from src.trading.indicators import Indicators, IndicatorSettings, Line, calculate
+from src.trading.market_worker import (
     MAX_MISSED_CANDLES,
     MIN_CANDLES_FOR_SIGNAL,
     MarketWorker,
@@ -19,10 +22,7 @@ from src.market_worker import (
     judge_candle,
     replay,
 )
-from src.repositories.indicator_info import IndicatorInfoRepository
-from src.repositories.market import MarketRepository
-from src.repositories.models import IndicatorInfo, IndicatorType
-from src.signals import CrossState, OverState, SignalSettings
+from src.trading.signals import CrossState, OverState, SignalSettings
 
 MACD_TYPES = (IndicatorType.MACD_SHORT, IndicatorType.MACD_MID, IndicatorType.MACD_LONG)
 

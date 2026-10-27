@@ -5,15 +5,15 @@ import sys
 from collections.abc import Sequence
 from pathlib import Path
 
-from src.application import Application
-from src.config import ConfigError, TradingConfig, load_config
-from src.database import Database, DatabaseConfig
-from src.indicators import IndicatorSettings
-from src.market_worker import MarketWorker
+from src.app.application import Application
+from src.app.config import ConfigError, TradingConfig, load_config
+from src.app.scheduler import CandleScheduler
+from src.connections.database import Database, DatabaseConfig
+from src.exchange.upbit_client import UpbitClient
 from src.repositories.market import MarketRepository
-from src.scheduler import CandleScheduler
-from src.signals import SignalSettings
-from src.upbit_client import UpbitClient
+from src.trading.indicators import IndicatorSettings
+from src.trading.market_worker import MarketWorker
+from src.trading.signals import SignalSettings
 
 logger = logging.getLogger(__name__)
 

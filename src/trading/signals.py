@@ -4,7 +4,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 
-from src.indicators import Line
+from src.trading.indicators import Line
 
 
 class OverState(StrEnum):

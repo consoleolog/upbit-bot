@@ -2,7 +2,7 @@ import asyncio
 
 import pytest
 
-from src.rate_limiter import RateLimiter
+from src.exchange.rate_limiter import RateLimiter
 
 
 class FakeTime:

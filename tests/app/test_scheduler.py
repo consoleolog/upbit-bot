@@ -3,9 +3,9 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from src.application import Job
-from src.config import Timeframe
-from src.scheduler import CandleScheduler, next_candle_close
+from src.app.application import Job
+from src.app.config import Timeframe
+from src.app.scheduler import CandleScheduler, next_candle_close
 
 
 @pytest.mark.parametrize(

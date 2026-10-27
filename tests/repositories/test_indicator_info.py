@@ -8,7 +8,7 @@ import pytest
 from src.repositories.indicator_info import IndicatorInfoRepository
 from src.repositories.market import MarketRepository
 from src.repositories.models import IndicatorInfo, IndicatorType
-from src.signals import CrossState, OverState
+from src.trading.signals import CrossState, OverState
 
 pytestmark = pytest.mark.integration
 
