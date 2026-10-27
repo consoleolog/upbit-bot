@@ -1,11 +1,14 @@
 from datetime import UTC, datetime
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
 from pytest_mock import MockerFixture
 
 from src.application import Application
-from src.main import EXIT_OK, EXIT_STARTUP_FAILED, candle_close_job, main, parse_args
+from src.candle import Candle
+from src.config import Timeframe, TradingConfig
+from src.main import EXIT_OK, EXIT_STARTUP_FAILED, candle_close_job_factory, main, parse_args, run
 
 
 def test_parse_args_reads_config_path() -> None:
@@ -63,10 +66,49 @@ def test_main_runs_application_with_scheduler(tmp_path: Path, mocker: MockerFixt
     assert add_service.call_args.args[1] == "scheduler:30m"
 
 
-async def test_candle_close_job_logs(caplog: pytest.LogCaptureFixture) -> None:
+class FakeUpbit:
+    def __init__(self, candles: list[Candle]) -> None:
+        self.candles = candles
+        self.calls: list[tuple[str, Timeframe, datetime]] = []
+
+    async def get_candles(self, market: str, timeframe: Timeframe, to: datetime) -> list[Candle]:
+        self.calls.append((market, timeframe, to))
+        return self.candles
+
+
+def _candle(start: datetime) -> Candle:
+    return Candle(market="KRW-BTC", start=start, open=Decimal(1), high=Decimal(2), low=Decimal(1), close=Decimal(2))
+
+
+async def test_candle_close_job_fetches_closed_candles(caplog: pytest.LogCaptureFixture) -> None:
+    caplog.set_level("INFO")
+    close = datetime(2026, 1, 1, 0, 30, tzinfo=UTC)
+    upbit = FakeUpbit([_candle(datetime(2026, 1, 1, 0, 0, tzinfo=UTC))])
+
+    await candle_close_job_factory(upbit, Timeframe.MINUTE_30)("KRW-BTC", close)()
+
+    # 마감 시각을 to로 넘겨 마감된 캔들만 받는다
+    assert upbit.calls == [("KRW-BTC", Timeframe.MINUTE_30, close)]
+    assert "candles=1, last=2026-01-01T09:00:00+09:00, last_close=2" in caplog.text
+
+
+async def test_candle_close_job_with_no_candles(caplog: pytest.LogCaptureFixture) -> None:
     caplog.set_level("INFO")
     close = datetime(2026, 1, 1, 0, 30, tzinfo=UTC)
 
-    await candle_close_job("KRW-BTC", close)()
+    await candle_close_job_factory(FakeUpbit([]), Timeframe.MINUTE_30)("KRW-BTC", close)()
 
-    assert "candle close job (market=KRW-BTC" in caplog.text
+    assert "candles=0, last=None" in caplog.text
+
+
+async def test_run_closes_client_after_application_stops(mocker: MockerFixture) -> None:
+    events: list[str] = []
+    mocker.patch("src.main.UpbitClient.open", side_effect=lambda: events.append("open"), new_callable=mocker.AsyncMock)
+    mocker.patch(
+        "src.main.UpbitClient.close", side_effect=lambda: events.append("close"), new_callable=mocker.AsyncMock
+    )
+    mocker.patch("src.main.Application.run", side_effect=lambda: events.append("run"), new_callable=mocker.AsyncMock)
+
+    await run(Path("config.json"), TradingConfig(timeframe=Timeframe.MINUTE_30, markets=("KRW-BTC",)))
+
+    assert events == ["open", "run", "close"]
