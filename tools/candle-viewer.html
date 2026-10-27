@@ -1,0 +1,380 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Upbit Candle Viewer</title>
+<!-- 개발용 도구. 봇과 분리되어 있으며, 업비트 공개 캔들 API를 브라우저에서 직접 조회한다 (API 키 없음, 읽기만 함).
+     지표와 신호는 docs/trading/logic.md 3~4장, 5.6, 7장 규칙을 JavaScript로 다시 구현한 것이다.
+     봇(Python)의 계산과 다를 수 있으므로 정답은 봇의 테스트로 정한다. -->
+<script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #ffffff; --fg: #1d2330; --muted: #6b7385; --line: #dfe3ea;
+    --up: #d1394b; --down: #2b6fd6; --accent: #7a4fd3; --signal: #e08a1e; --ok: #1f9d55;
+    --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    --sans: system-ui, -apple-system, "Apple SD Gothic Neo", "Malgun Gothic", sans-serif;
+    color-scheme: light;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #11141a; --panel: #181c24; --fg: #e4e7ee; --muted: #8b93a5; --line: #2a303c;
+      --up: #f0566a; --down: #4d8ef0; --accent: #a383f0; --signal: #f0a040; --ok: #3cc47a; color-scheme: dark; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg); font: 14px/1.5 var(--sans);
+    padding: 16px max(16px, env(safe-area-inset-right)) 32px max(16px, env(safe-area-inset-left)); }
+  header { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; margin-bottom: 12px; }
+  h1 { font-size: 16px; margin: 0 12px 0 0; letter-spacing: 0.02em; }
+  label { color: var(--muted); font-size: 12px; display: flex; gap: 6px; align-items: center; }
+  input, select { font: 13px var(--mono); padding: 4px 6px; border: 1px solid var(--line); border-radius: 4px;
+    background: var(--panel); color: var(--fg); }
+  input { width: 110px; }
+  #status { font: 12px var(--mono); color: var(--muted); margin-left: auto; }
+  #status.error { color: var(--up); }
+  main { display: grid; grid-template-columns: minmax(0, 1fr) 280px; gap: 12px; }
+  @media (max-width: 900px) { main { grid-template-columns: minmax(0, 1fr); } }
+  .charts { display: grid; gap: 4px; min-width: 0; }
+  .pane { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; position: relative; }
+  .pane .title { position: absolute; top: 4px; left: 8px; z-index: 2; font: 11px var(--mono); color: var(--muted);
+    pointer-events: none; }
+  #price { height: 360px; } .sub { height: 150px; }
+  aside { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 12px; font-size: 13px;
+    align-self: start; }
+  aside h2 { font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); margin: 14px 0 6px; }
+  aside h2:first-child { margin-top: 0; }
+  table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+  td { padding: 3px 0; border-bottom: 1px solid var(--line); }
+  td:last-child { text-align: right; font-family: var(--mono); font-size: 12px; }
+  .yes { color: var(--ok); } .no { color: var(--muted); }
+  .state-GOLDEN_CROSS { color: var(--ok); } .state-DEAD_CROSS { color: var(--up); }
+  .state-OVER_SOLD { color: var(--down); } .state-OVER_BOUGHT { color: var(--up); }
+  .note { color: var(--muted); font-size: 12px; margin-top: 12px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Upbit Candle Viewer</h1>
+  <label for="market">마켓 <input id="market" value="KRW-BTC" spellcheck="false"></label>
+  <label for="unit">캔들
+    <select id="unit">
+      <option value="1">1분</option><option value="3">3분</option><option value="5">5분</option>
+      <option value="10">10분</option><option value="15">15분</option><option value="30" selected>30분</option>
+      <option value="60">60분</option><option value="240">240분</option>
+    </select>
+  </label>
+  <span id="status">불러오는 중</span>
+</header>
+<main>
+  <div class="charts">
+    <div class="pane" id="price"><span class="title">가격 (KST) · 흐린 캔들 = 진행 중 · ▲ 매수 조건 충족</span></div>
+    <div class="pane sub" id="rsi"><span class="title">RSI 14 / 시그널 9 · 31 / 60</span></div>
+    <div class="pane sub" id="stoch"><span class="title">Stochastic slow 14·3·4 · 25 / 75</span></div>
+    <div class="pane sub" id="macd"><span class="title">MACD short(5-8) · mid(5-13) · long(8-13) / 시그널 9</span></div>
+  </div>
+  <aside>
+    <h2>신호 상태 (마지막 마감 캔들)</h2>
+    <table id="states"></table>
+    <h2>매수 조건 (logic.md 5.6)</h2>
+    <table id="conditions"></table>
+    <p class="note">매수 조건이 충족되면 체결됐다고 가정하고 모든 신호를 비웁니다 (logic.md 7장). 매도는 보유 포지션이 필요해 표시하지 않습니다.</p>
+  </aside>
+</main>
+<script>
+"use strict";
+
+// docs/trading/logic.md 2.1의 기본값
+const CONFIG = {
+  ema: { short: 5, mid: 8, long: 13 }, macdSignal: 9,
+  rsi: { period: 14, signal: 9 }, stochastic: { kLen: 14, kSmooth: 3, dSmooth: 4 },
+  threshold: { rsi: { overSold: 31, overBought: 60 }, stochastic: { overSold: 25, overBought: 75 }, entryMax: 50 },
+};
+const REFRESH_MS = 5000;           // 캔들 그룹 한도(초당 10회)에 비해 충분히 느림
+const KST_OFFSET = 9 * 3600;       // 차트 시간축을 한국 시간으로 보이게 함
+
+// ---------------------------------------------------------------- 지표 (logic.md 3장)
+
+function sma(values, n) {
+  return values.map((_, i) => {
+    if (i < n - 1) return null;
+    const window = values.slice(i - n + 1, i + 1);
+    return window.some((v) => v === null) ? null : window.reduce((a, b) => a + b, 0) / n;
+  });
+}
+
+// 평활 계수 2/(n+1). 첫 값은 처음 n개(앞쪽 null 제외)의 단순평균
+function ema(values, n) {
+  const out = values.map(() => null);
+  const start = values.findIndex((v) => v !== null);
+  if (start < 0 || start + n > values.length) return out;
+  const k = 2 / (n + 1);
+  let prev = values.slice(start, start + n).reduce((a, b) => a + b, 0) / n;
+  out[start + n - 1] = prev;
+  for (let i = start + n; i < values.length; i++) {
+    prev = values[i] * k + prev * (1 - k);
+    out[i] = prev;
+  }
+  return out;
+}
+
+// Wilder 방식. 하락이 없으면 100, 변동이 전혀 없으면 50
+function rsi(closes, n) {
+  const out = closes.map(() => null);
+  if (closes.length <= n) return out;
+  let gain = 0, loss = 0;
+  for (let i = 1; i <= n; i++) {
+    const d = closes[i] - closes[i - 1];
+    gain += Math.max(d, 0); loss += Math.max(-d, 0);
+  }
+  gain /= n; loss /= n;
+  const value = () => (gain + loss === 0 ? 50 : (100 * gain) / (gain + loss));
+  out[n] = value();
+  for (let i = n + 1; i < closes.length; i++) {
+    const d = closes[i] - closes[i - 1];
+    gain = (gain * (n - 1) + Math.max(d, 0)) / n;
+    loss = (loss * (n - 1) + Math.max(-d, 0)) / n;
+    out[i] = value();
+  }
+  return out;
+}
+
+// 최근 kLen개 최고가 = 최저가이면 그 캔들의 값은 없음(null) → 그 캔들에서는 상태를 갱신하지 않음
+function stochastic(candles, { kLen, kSmooth, dSmooth }) {
+  const fast = candles.map((_, i) => {
+    if (i < kLen - 1) return null;
+    const w = candles.slice(i - kLen + 1, i + 1);
+    const hi = Math.max(...w.map((c) => c.high)), lo = Math.min(...w.map((c) => c.low));
+    return hi === lo ? null : ((candles[i].close - lo) / (hi - lo)) * 100;
+  });
+  const k = sma(fast, kSmooth);
+  return { k, d: sma(k, dSmooth) };
+}
+
+function indicators(candles) {
+  const closes = candles.map((c) => c.close);
+  const e = { short: ema(closes, CONFIG.ema.short), mid: ema(closes, CONFIG.ema.mid), long: ema(closes, CONFIG.ema.long) };
+  const diff = (a, b) => a.map((v, i) => (v === null || b[i] === null ? null : v - b[i]));
+  const macd = {};
+  for (const [name, [a, b]] of Object.entries({ short: [e.short, e.mid], mid: [e.short, e.long], long: [e.mid, e.long] })) {
+    const line = diff(a, b);
+    macd[name] = { main: line, signal: ema(line, CONFIG.macdSignal) };
+  }
+  const r = rsi(closes, CONFIG.rsi.period);
+  const st = stochastic(candles, CONFIG.stochastic);
+  return { rsi: { main: r, signal: ema(r, CONFIG.rsi.signal) }, stoch: { main: st.k, signal: st.d }, macd };
+}
+
+// ---------------------------------------------------------------- 신호 (logic.md 4장, 5.6, 7장)
+
+function cross(main, signal, i) {
+  if (i < 1 || [main[i - 1], signal[i - 1], main[i], signal[i]].includes(null)) return null;
+  if (main[i - 1] <= signal[i - 1] && main[i] > signal[i]) return "GOLDEN_CROSS";
+  if (main[i - 1] >= signal[i - 1] && main[i] < signal[i]) return "DEAD_CROSS";
+  return null;
+}
+
+function signals(candles, ind) {
+  const t = CONFIG.threshold;
+  const emptyState = () => ({ rsi: { over: null, cross: null }, stoch: { over: null, cross: null },
+    macd_short: { cross: null }, macd_mid: { cross: null }, macd_long: { cross: null } });
+  let state = emptyState();
+  const events = { rsi: [], stoch: [], macd: [], buy: [] };
+  let conditions = [];
+
+  for (let i = 0; i < candles.length; i++) {
+    const time = candles[i].time;
+    // RSI
+    const r = ind.rsi.main[i];
+    if (r !== null) {
+      if (r <= t.rsi.overSold) state.rsi.over = "OVER_SOLD";
+      else if (r >= t.rsi.overBought) state.rsi.over = "OVER_BOUGHT";
+    }
+    const rc = cross(ind.rsi.main, ind.rsi.signal, i);
+    if (rc) { state.rsi.cross = rc; events.rsi.push({ time, kind: rc }); }
+    // 스토캐스틱: %K, %D 모두 기준을 넘어야 함
+    const k = ind.stoch.main[i], d = ind.stoch.signal[i];
+    if (k !== null && d !== null) {
+      if (k <= t.stochastic.overSold && d <= t.stochastic.overSold) state.stoch.over = "OVER_SOLD";
+      else if (k >= t.stochastic.overBought && d >= t.stochastic.overBought) state.stoch.over = "OVER_BOUGHT";
+    }
+    const sc = cross(ind.stoch.main, ind.stoch.signal, i);
+    if (sc) { state.stoch.cross = sc; events.stoch.push({ time, kind: sc }); }
+    // MACD 3종
+    let macdChanged = false;
+    for (const name of ["short", "mid", "long"]) {
+      const mc = cross(ind.macd[name].main, ind.macd[name].signal, i);
+      if (mc) { state["macd_" + name].cross = mc; macdChanged = true; events.macd.push({ time, kind: mc, name }); }
+    }
+    // 7장: MACD 3종이 모두 데드크로스가 되면 RSI, 스토캐스틱 신호를 비움
+    if (macdChanged && ["short", "mid", "long"].every((n) => state["macd_" + n].cross === "DEAD_CROSS")) {
+      state.rsi = { over: null, cross: null };
+      state.stoch = { over: null, cross: null };
+    }
+    // 5.6 매수 조건 9개
+    conditions = [
+      ["RSI 과매도", state.rsi.over === "OVER_SOLD"],
+      ["RSI 골든크로스", state.rsi.cross === "GOLDEN_CROSS"],
+      ["스토캐스틱 과매도", state.stoch.over === "OVER_SOLD"],
+      ["스토캐스틱 골든크로스", state.stoch.cross === "GOLDEN_CROSS"],
+      ["MACD short 골든크로스", state.macd_short.cross === "GOLDEN_CROSS"],
+      ["MACD mid 골든크로스", state.macd_mid.cross === "GOLDEN_CROSS"],
+      ["MACD long 골든크로스", state.macd_long.cross === "GOLDEN_CROSS"],
+      [`%D ≤ ${t.entryMax}`, d !== null && d <= t.entryMax],
+      [`%K ≤ ${t.entryMax}`, k !== null && k <= t.entryMax],
+    ];
+    if (conditions.every(([, ok]) => ok)) {
+      events.buy.push({ time });
+      state = emptyState(); // 체결됐다고 가정하고 모든 신호를 비움 (7장)
+    }
+  }
+  return { state, events, conditions };
+}
+
+// ---------------------------------------------------------------- 데이터
+
+async function fetchCandles(market, unit) {
+  const url = `https://api.upbit.com/v1/candles/minutes/${unit}?market=${encodeURIComponent(market)}&count=200`;
+  const response = await fetch(url);
+  if (!response.ok) throw new Error(`${response.status} ${await response.text()}`);
+  const raw = await response.json();
+  if (!Array.isArray(raw)) throw new Error("응답이 목록이 아닙니다");
+  const nowSec = Date.now() / 1000;
+  return raw.reverse().map((r) => {
+    const startSec = Date.parse(r.candle_date_time_utc + "Z") / 1000;
+    return {
+      time: startSec + KST_OFFSET,
+      open: r.opening_price, high: r.high_price, low: r.low_price, close: r.trade_price,
+      closed: startSec + unit * 60 <= nowSec, // 업비트는 진행 중인 캔들도 줌
+    };
+  });
+}
+
+// ---------------------------------------------------------------- 차트
+
+const css = (name) => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+const charts = [];
+let syncing = false;
+
+function makeChart(id) {
+  const el = document.getElementById(id);
+  const chart = LightweightCharts.createChart(el, {
+    autoSize: true,
+    layout: { background: { color: "transparent" }, textColor: css("--muted"), fontFamily: css("--mono"), fontSize: 11 },
+    grid: { vertLines: { color: css("--line") }, horzLines: { color: css("--line") } },
+    rightPriceScale: { borderColor: css("--line"), minimumWidth: 110 }, // 축 폭을 맞춰야 차트끼리 시간축이 정렬됨
+    timeScale: { borderColor: css("--line"), timeVisible: true, secondsVisible: false },
+    crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
+  });
+  chart.timeScale().subscribeVisibleLogicalRangeChange((range) => {
+    if (syncing || !range) return;
+    syncing = true;
+    charts.forEach((other) => other !== chart && other.timeScale().setVisibleLogicalRange(range));
+    syncing = false;
+  });
+  charts.push(chart);
+  return chart;
+}
+
+const line = (chart, color, width = 1.5) =>
+  chart.addLineSeries({ color, lineWidth: width, priceLineVisible: false, lastValueVisible: false });
+
+const priceChart = makeChart("price");
+const candleSeries = priceChart.addCandlestickSeries({
+  upColor: css("--up"), downColor: css("--down"), borderVisible: false,
+  wickUpColor: css("--up"), wickDownColor: css("--down"),
+});
+const rsiChart = makeChart("rsi");
+const rsiMain = line(rsiChart, css("--accent")), rsiSignal = line(rsiChart, css("--signal"), 1);
+[CONFIG.threshold.rsi.overSold, CONFIG.threshold.rsi.overBought].forEach((price) =>
+  rsiMain.createPriceLine({ price, color: css("--muted"), lineStyle: 2, lineWidth: 1, axisLabelVisible: true }));
+const stochChart = makeChart("stoch");
+const stochK = line(stochChart, css("--accent")), stochD = line(stochChart, css("--signal"), 1);
+[CONFIG.threshold.stochastic.overSold, CONFIG.threshold.stochastic.overBought, CONFIG.threshold.entryMax].forEach((price) =>
+  stochK.createPriceLine({ price, color: css("--muted"), lineStyle: 2, lineWidth: 1, axisLabelVisible: true }));
+const macdChart = makeChart("macd");
+const macdLines = {
+  short: { main: line(macdChart, css("--accent")), signal: line(macdChart, css("--accent"), 1) },
+  mid: { main: line(macdChart, css("--signal")), signal: line(macdChart, css("--signal"), 1) },
+  long: { main: line(macdChart, css("--ok")), signal: line(macdChart, css("--ok"), 1) },
+};
+Object.values(macdLines).forEach((s) => s.signal.applyOptions({ lineStyle: 2 }));
+
+// 모든 차트가 같은 시각 목록을 가져야 서로 정렬된다. 값이 없는 자리(지표 준비 구간, 진행 중인 캔들)는 빈 칸으로 둔다
+const points = (candles, values) =>
+  candles.map((c, i) => (values[i] === undefined || values[i] === null ? { time: c.time } : { time: c.time, value: values[i] }));
+
+function crossMarkers(events) {
+  return events.map((e) => ({
+    time: e.time,
+    position: e.kind === "GOLDEN_CROSS" ? "belowBar" : "aboveBar",
+    color: e.kind === "GOLDEN_CROSS" ? css("--ok") : css("--up"),
+    shape: e.kind === "GOLDEN_CROSS" ? "arrowUp" : "arrowDown",
+  }));
+}
+
+function renderSide(state, conditions) {
+  const cell = (v) => `<span class="state-${v ?? "none"}">${v ?? "—"}</span>`;
+  document.getElementById("states").innerHTML = [
+    ["RSI 극단값", state.rsi.over], ["RSI 크로스", state.rsi.cross],
+    ["스토캐스틱 극단값", state.stoch.over], ["스토캐스틱 크로스", state.stoch.cross],
+    ["MACD short", state.macd_short.cross], ["MACD mid", state.macd_mid.cross], ["MACD long", state.macd_long.cross],
+  ].map(([name, v]) => `<tr><td>${name}</td><td>${cell(v)}</td></tr>`).join("");
+  document.getElementById("conditions").innerHTML = conditions
+    .map(([name, ok]) => `<tr><td>${name}</td><td class="${ok ? "yes" : "no"}">${ok ? "✓" : "✗"}</td></tr>`).join("");
+}
+
+let firstLoad = true;
+let loading = false;
+
+async function refresh() {
+  if (loading) return;
+  loading = true;
+  const market = document.getElementById("market").value.trim().toUpperCase();
+  const unit = Number(document.getElementById("unit").value);
+  const status = document.getElementById("status");
+  try {
+    const all = await fetchCandles(market, unit);
+    const closed = all.filter((c) => c.closed); // 지표와 신호는 마감된 캔들로만 계산 (logic.md 1.1)
+    const ind = indicators(closed);
+    const { state, events, conditions } = signals(closed, ind);
+
+    // 원화 호가 단위에 맞춰 소수 자릿수를 정함 (100원 이상은 정수)
+    const lastPrice = all.length ? all[all.length - 1].close : 1;
+    const precision = lastPrice >= 100 ? 0 : lastPrice >= 1 ? 2 : 4;
+    candleSeries.applyOptions({ priceFormat: { type: "price", precision, minMove: 10 ** -precision } });
+    candleSeries.setData(all.map((c) => (c.closed ? c : { ...c, color: css("--muted"), wickColor: css("--muted") })));
+    candleSeries.setMarkers(events.buy.map((e) => ({ time: e.time, position: "belowBar", color: css("--ok"), shape: "arrowUp", text: "매수" })));
+    rsiMain.setData(points(all, ind.rsi.main)); rsiSignal.setData(points(all, ind.rsi.signal));
+    rsiMain.setMarkers(crossMarkers(events.rsi));
+    stochK.setData(points(all, ind.stoch.main)); stochD.setData(points(all, ind.stoch.signal));
+    stochK.setMarkers(crossMarkers(events.stoch));
+    for (const name of ["short", "mid", "long"]) {
+      macdLines[name].main.setData(points(all, ind.macd[name].main));
+      macdLines[name].signal.setData(points(all, ind.macd[name].signal));
+    }
+    renderSide(state, conditions);
+
+    if (firstLoad) {
+      // 아래 차트들은 진행 중인 캔들이 없어 길이가 하나 짧을 수 있으므로, 시간으로 같은 범위를 지정한다
+      const from = all[Math.max(0, all.length - 120)].time, to = all[all.length - 1].time;
+      charts.forEach((chart) => chart.timeScale().setVisibleRange({ from, to }));
+      firstLoad = false;
+    }
+    const last = closed[closed.length - 1];
+    const kst = (sec) => new Date(sec * 1000).toISOString().slice(5, 16).replace("T", " ");
+    status.className = "";
+    status.textContent = `${market} ${unit}분 · 마감 캔들 ${closed.length}개 · 마지막 마감 ${last ? kst(last.time) : "—"} KST · ${new Date().toLocaleTimeString("ko-KR")} 갱신`;
+  } catch (error) {
+    status.className = "error";
+    status.textContent = `조회 실패: ${error.message}`;
+  } finally {
+    loading = false;
+  }
+}
+
+document.getElementById("market").addEventListener("change", () => { firstLoad = true; refresh(); });
+document.getElementById("unit").addEventListener("change", () => { firstLoad = true; refresh(); });
+refresh();
+setInterval(refresh, REFRESH_MS);
+</script>
+</body>
+</html>
