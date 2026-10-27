@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from src.application import Application, Job
+from src.app.application import Application, Job
 
 STOP_TIMEOUT = 1.0
 

@@ -9,7 +9,7 @@ import pytest_asyncio
 from faker import Faker
 from freezegun import freeze_time as _freeze_time
 
-from src.database import Database, DatabaseConfig
+from src.connections.database import Database, DatabaseConfig
 
 # ---------------------------------------------------------------------------
 # Faker

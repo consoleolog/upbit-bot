@@ -3,8 +3,8 @@ import logging
 from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime
 
-from src.application import Job
-from src.config import Timeframe
+from src.app.application import Job
+from src.app.config import Timeframe
 
 logger = logging.getLogger(__name__)
 

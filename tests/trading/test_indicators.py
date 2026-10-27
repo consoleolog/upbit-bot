@@ -4,8 +4,8 @@ from itertools import pairwise
 
 import pytest
 
-from src.candle import Candle
-from src.indicators import IndicatorSettings, Line, calculate, macd, rsi, stochastic_slow
+from src.exchange.candle import Candle
+from src.trading.indicators import IndicatorSettings, Line, calculate, macd, rsi, stochastic_slow
 
 
 def _ema(values: list[float | None], period: int) -> list[float | None]:

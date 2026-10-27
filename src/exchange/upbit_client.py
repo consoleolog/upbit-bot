@@ -6,9 +6,9 @@ from typing import Any, Literal, Self
 
 import httpx
 
-from src.candle import Candle
-from src.config import Timeframe
-from src.rate_limiter import RateLimiter
+from src.app.config import Timeframe
+from src.exchange.candle import Candle
+from src.exchange.rate_limiter import RateLimiter
 
 BASE_URL = "https://api.upbit.com"
 

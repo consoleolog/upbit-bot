@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from src.config import ConfigError, Timeframe, TradingConfig, load_config
+from src.app.config import ConfigError, Timeframe, TradingConfig, load_config
 
 
 def _write(tmp_path: Path, data: object) -> Path:

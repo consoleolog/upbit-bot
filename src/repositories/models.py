@@ -8,7 +8,7 @@ from typing import Self
 
 import asyncpg
 
-from src.signals import CrossState, OverState
+from src.trading.signals import CrossState, OverState
 
 
 @dataclass(frozen=True, kw_only=True)
