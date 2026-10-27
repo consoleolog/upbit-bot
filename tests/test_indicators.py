@@ -1,9 +1,11 @@
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from itertools import pairwise
 
 import pytest
 
-from src.indicators import Line, macd, rsi, stochastic_slow
+from src.candle import Candle
+from src.indicators import IndicatorSettings, Line, calculate, macd, rsi, stochastic_slow
 
 
 def _ema(values: list[float | None], period: int) -> list[float | None]:
@@ -207,3 +209,53 @@ def test_stochastic_rejects_invalid_arguments() -> None:
         stochastic_slow(_decimals(HIGHS), _decimals(LOWS), _decimals(CLOSES_HL), k_len=0, k_smooth=2, d_smooth=3)
     with pytest.raises(ValueError, match="same length"):
         stochastic_slow(_decimals(HIGHS), _decimals(LOWS[:-1]), _decimals(CLOSES_HL), k_len=4, k_smooth=2, d_smooth=3)
+
+
+def test_calculate_uses_settings_for_each_indicator() -> None:
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    candles = [
+        Candle(
+            market="KRW-BTC",
+            start=start + timedelta(minutes=30 * i),
+            open=Decimal(c),
+            high=Decimal(h),
+            low=Decimal(lo),
+            close=Decimal(c),
+        )
+        for i, (h, lo, c) in enumerate(zip(HIGHS, LOWS, CLOSES_HL, strict=True))
+    ]
+    settings = IndicatorSettings(
+        ema_short=2,
+        ema_mid=3,
+        ema_long=4,
+        macd_signal=2,
+        rsi_period=3,
+        rsi_signal=2,
+        stochastic_k_len=4,
+        stochastic_k_smooth=2,
+        stochastic_d_smooth=3,
+    )
+    closes = _decimals(CLOSES_HL)
+
+    result = calculate(candles, settings)
+
+    assert result.macd_short == macd(closes, 2, 3, 2)
+    assert result.macd_mid == macd(closes, 2, 4, 2)
+    assert result.macd_long == macd(closes, 3, 4, 2)
+    assert result.rsi == rsi(closes, 3, 2)
+    assert result.stochastic == _stochastic(HIGHS, LOWS, CLOSES_HL)
+
+
+def test_default_settings_follow_trading_logic() -> None:
+    # 매매 로직 2.1 설정 예시
+    assert IndicatorSettings() == IndicatorSettings(
+        ema_short=5,
+        ema_mid=8,
+        ema_long=13,
+        macd_signal=9,
+        rsi_period=14,
+        rsi_signal=9,
+        stochastic_k_len=14,
+        stochastic_k_smooth=3,
+        stochastic_d_smooth=4,
+    )

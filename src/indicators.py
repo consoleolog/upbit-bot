@@ -12,6 +12,8 @@ import numpy as np
 import talib
 from numpy.lib.stride_tricks import sliding_window_view
 
+from src.candle import Candle
+
 Series = tuple[float | None, ...]
 
 
@@ -21,6 +23,52 @@ class Line:
 
     main: Series
     signal: Series
+
+
+@dataclass(frozen=True, kw_only=True)
+class IndicatorSettings:
+    """지표 기간. 기본값은 매매 로직 2.1의 설정 예시다."""
+
+    ema_short: int = 5
+    ema_mid: int = 8
+    ema_long: int = 13
+    macd_signal: int = 9
+    rsi_period: int = 14
+    rsi_signal: int = 9
+    stochastic_k_len: int = 14
+    stochastic_k_smooth: int = 3
+    stochastic_d_smooth: int = 4
+
+
+@dataclass(frozen=True, kw_only=True)
+class Indicators:
+    """한 마켓의 보조지표. 각 값 목록은 계산에 쓴 캔들과 같은 길이다."""
+
+    macd_short: Line
+    macd_mid: Line
+    macd_long: Line
+    rsi: Line
+    stochastic: Line
+
+
+def calculate(candles: Sequence[Candle], settings: IndicatorSettings) -> Indicators:
+    """마감된 캔들로 매매 로직 3장의 보조지표를 모두 계산한다."""
+    closes = [candle.close for candle in candles]
+    s = settings
+    return Indicators(
+        macd_short=macd(closes, s.ema_short, s.ema_mid, s.macd_signal),
+        macd_mid=macd(closes, s.ema_short, s.ema_long, s.macd_signal),
+        macd_long=macd(closes, s.ema_mid, s.ema_long, s.macd_signal),
+        rsi=rsi(closes, s.rsi_period, s.rsi_signal),
+        stochastic=stochastic_slow(
+            [candle.high for candle in candles],
+            [candle.low for candle in candles],
+            closes,
+            s.stochastic_k_len,
+            s.stochastic_k_smooth,
+            s.stochastic_d_smooth,
+        ),
+    )
 
 
 def macd(closes: Sequence[Decimal], fast: int, slow: int, signal: int) -> Line:
