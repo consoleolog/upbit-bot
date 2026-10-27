@@ -11,9 +11,7 @@ from src.app.scheduler import CandleScheduler
 from src.connections.database import Database, DatabaseConfig
 from src.exchange.upbit_client import UpbitClient
 from src.repositories.market import MarketRepository
-from src.trading.indicators import IndicatorSettings
 from src.trading.market_worker import MarketWorker
-from src.trading.signals import SignalSettings
 
 logger = logging.getLogger(__name__)
 
@@ -35,13 +33,12 @@ async def run(config_path: Path, config: TradingConfig, db_config: DatabaseConfi
         market_ids = await register_markets(database, config.markets)
         async with UpbitClient() as upbit:
             app = Application(config_path)
-            # 지표 기간과 신호 기준은 설정 파일에서 읽기 전까지 매매 로직 2.1의 기본값을 쓴다
             worker = MarketWorker(
                 upbit=upbit,
                 database=database,
                 timeframe=config.timeframe,
-                indicator_settings=IndicatorSettings(),
-                signal_settings=SignalSettings(),
+                indicator_settings=config.indicator,
+                signal_settings=config.signal,
                 market_ids=market_ids,
             )
             scheduler = CandleScheduler(

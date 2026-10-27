@@ -8,6 +8,8 @@ from src.app.application import Application
 from src.app.config import Timeframe, TradingConfig
 from src.connections.database import Database, DatabaseConfig
 from src.main import EXIT_OK, EXIT_STARTUP_FAILED, main, parse_args, register_markets, run
+from src.trading.indicators import IndicatorSettings
+from src.trading.signals import SignalSettings, Threshold
 
 
 def test_parse_args_reads_config_path() -> None:
@@ -107,6 +109,26 @@ async def test_run_closes_connections_after_application_stops(mocker: MockerFixt
     await run(Path("config.json"), TradingConfig(timeframe=Timeframe.MINUTE_30, markets=("KRW-BTC",)), DB_CONFIG)
 
     assert events == ["db open", "upbit open", "run", "upbit close", "db close"]
+
+
+async def test_run_passes_configured_settings_to_worker(mocker: MockerFixture) -> None:
+    mocker.patch("src.main.Database.connect", new_callable=mocker.AsyncMock)
+    mocker.patch("src.main.Database.close", new_callable=mocker.AsyncMock)
+    mocker.patch("src.main.register_markets", new_callable=mocker.AsyncMock, return_value={"KRW-BTC": 1})
+    mocker.patch("src.main.Application.run", new_callable=mocker.AsyncMock)
+    worker = mocker.patch("src.main.MarketWorker")
+    config = TradingConfig(
+        timeframe=Timeframe.MINUTE_30,
+        markets=("KRW-BTC",),
+        indicator=IndicatorSettings(rsi_period=10),
+        signal=SignalSettings(rsi=Threshold(over_sold=20, over_bought=80)),
+    )
+
+    await run(Path("config.json"), config, DB_CONFIG)
+
+    kwargs = worker.call_args.kwargs
+    assert kwargs["indicator_settings"] is config.indicator
+    assert kwargs["signal_settings"] is config.signal
 
 
 async def test_run_closes_database_when_market_registration_fails(mocker: MockerFixture) -> None:
