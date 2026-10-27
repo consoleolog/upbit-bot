@@ -7,9 +7,12 @@ from pathlib import Path
 
 from src.application import Application
 from src.config import ConfigError, TradingConfig, load_config
+from src.database import Database, DatabaseConfig
 from src.indicators import IndicatorSettings
 from src.market_worker import MarketWorker
+from src.repositories.market import MarketRepository
 from src.scheduler import CandleScheduler
+from src.signals import SignalSettings
 from src.upbit_client import UpbitClient
 
 logger = logging.getLogger(__name__)
@@ -24,17 +27,42 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-async def run(config_path: Path, config: TradingConfig) -> None:
-    # 연결은 애플리케이션이 작업을 모두 정리한 뒤에 닫는다
-    async with UpbitClient() as upbit:
-        app = Application(config_path)
-        # 지표 기간은 설정 파일에서 읽기 전까지 매매 로직 2.1의 기본값을 쓴다
-        worker = MarketWorker(upbit=upbit, timeframe=config.timeframe, settings=IndicatorSettings())
-        scheduler = CandleScheduler(
-            timeframe=config.timeframe, markets=config.markets, submit=app.submit, job_factory=worker.candle_close_job
-        )
-        app.add_service(f"scheduler:{config.timeframe}", scheduler.run)
-        await app.run()
+async def run(config_path: Path, config: TradingConfig, db_config: DatabaseConfig) -> None:
+    database = Database(db_config)
+    await database.connect()
+    # 연결은 애플리케이션이 작업을 모두 정리한 뒤에 닫는다 (업비트 → DB 순서)
+    try:
+        market_ids = await register_markets(database, config.markets)
+        async with UpbitClient() as upbit:
+            app = Application(config_path)
+            # 지표 기간과 신호 기준은 설정 파일에서 읽기 전까지 매매 로직 2.1의 기본값을 쓴다
+            worker = MarketWorker(
+                upbit=upbit,
+                database=database,
+                timeframe=config.timeframe,
+                indicator_settings=IndicatorSettings(),
+                signal_settings=SignalSettings(),
+                market_ids=market_ids,
+            )
+            scheduler = CandleScheduler(
+                timeframe=config.timeframe,
+                markets=config.markets,
+                submit=app.submit,
+                job_factory=worker.candle_close_job,
+            )
+            app.add_service(f"scheduler:{config.timeframe}", scheduler.run)
+            await app.run()
+    finally:
+        await database.close()
+
+
+async def register_markets(database: Database, markets: Sequence[str]) -> dict[str, int]:
+    """설정의 마켓을 등록하고(이미 있으면 그대로) 마켓 코드별 market_id를 돌려준다."""
+    repo = MarketRepository()
+    async with database.transaction() as conn:
+        for market in markets:
+            await repo.add(conn, market)
+        return {market: (await repo.get_by_symbol(conn, market)).market_id for market in markets}
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -47,8 +75,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     except ConfigError as error:
         logger.error("invalid config: %s", error)
         return EXIT_STARTUP_FAILED
+    try:
+        db_config = DatabaseConfig.from_env("DB_")
+    except ValueError as error:
+        logger.error("invalid database config: %s", error)
+        return EXIT_STARTUP_FAILED
 
-    asyncio.run(run(args.config, config))
+    asyncio.run(run(args.config, config, db_config))
     return EXIT_OK
 
 

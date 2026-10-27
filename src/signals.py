@@ -56,3 +56,11 @@ def cross(line: Line) -> CrossState | None:
     if prev_main >= prev_signal and main < signal:
         return CrossState.DEAD_CROSS
     return None
+
+
+@dataclass(frozen=True, kw_only=True)
+class SignalSettings:
+    """과매도/과매수 기준. 기본값은 매매 로직 2.1의 설정 예시다."""
+
+    rsi: Threshold = Threshold(over_sold=31, over_bought=60)
+    stochastic: Threshold = Threshold(over_sold=25, over_bought=75)
