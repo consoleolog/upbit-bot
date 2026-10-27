@@ -1,6 +1,6 @@
 import logging
-from collections.abc import Mapping
-from dataclasses import replace
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Protocol
 
@@ -17,6 +17,8 @@ logger = logging.getLogger(__name__)
 
 # 계산 구간이 이보다 짧으면 지표 초기 값의 차이가 커서 신호를 갱신하지 않는다 (매매 로직 3.0)
 MIN_CANDLES_FOR_SIGNAL = 150
+# 놓친 캔들이 이보다 많으면 그 사이의 신호는 이미 지난 것으로 보고 상태를 비운다 (매매 로직 3.0)
+MAX_MISSED_CANDLES = 50
 
 
 class CandleSource(Protocol):
@@ -68,31 +70,81 @@ class MarketWorker:
                 expected.isoformat(),
                 candles[-1].start.isoformat(),
             )
-        indicators = calculate(candles, self._indicator_settings)
         async with self._database.transaction() as conn:
             previous = await self._indicator_infos.list_by_market(conn, market_id)
-            infos = next_indicator_infos(
+            result = replay(
                 market_id=market_id,
-                candle_time=candles[-1].start,
-                indicators=indicators,
+                candles=candles,
                 previous=previous,
-                settings=self._signal_settings,
-                judge=len(candles) >= MIN_CANDLES_FOR_SIGNAL,
+                timeframe=self._timeframe,
+                indicator_settings=self._indicator_settings,
+                signal_settings=self._signal_settings,
             )
-            saved = [info for info in infos if await self._indicator_infos.save(conn, info) is not None]
+            saved = [info for info in result.infos if await self._indicator_infos.save(conn, info) is not None]
         # 커밋된 뒤에 기록한다
+        if result.reset:
+            logger.warning("missed more than %d candles; signal states reset (market=%s)", MAX_MISSED_CANDLES, market)
         logger.info(
-            "candle close (market=%s, close=%s, candles=%d, last=%s, saved=%d) %s",
+            "candle close (market=%s, close=%s, candles=%d, last=%s, judged=%d, saved=%d) %s",
             market,
             close.isoformat(),
             len(candles),
             candles[-1].start_kst.isoformat(),
+            result.judged,
             len(saved),
             " ".join(_describe(info) for info in saved),
         )
 
 
-def next_indicator_infos(
+@dataclass(frozen=True, kw_only=True)
+class ReplayResult:
+    infos: tuple[IndicatorInfo, ...]
+    # 판정한 캔들 수. 놓친 캔들을 다시 판정하면 2 이상이다
+    judged: int
+    # 놓친 캔들이 너무 많아 신호 상태를 비웠는지
+    reset: bool
+
+
+def replay(
+    *,
+    market_id: int,
+    candles: Sequence[Candle],
+    previous: Mapping[IndicatorType, IndicatorInfo],
+    timeframe: Timeframe,
+    indicator_settings: IndicatorSettings,
+    signal_settings: SignalSettings,
+) -> ReplayResult:
+    """마지막으로 처리한 캔들 이후의 마감 캔들을 오래된 것부터 하나씩 판정한다 (매매 로직 3.0).
+
+    처음 처리하면 마지막 캔들만 판정한다. 놓친 캔들이 MAX_MISSED_CANDLES를 넘으면 신호 상태를 비우고 마지막 캔들만 판정한다.
+    각 캔들의 지표는 받은 캔들 중 그 캔들까지의 구간으로 계산한다. 이미 모두 처리했으면 infos는 비어 있다.
+    """
+    last_done = max((info.candle_time for info in previous.values()), default=None)
+    latest = candles[-1].start
+    if last_done is not None and last_done >= latest:
+        return ReplayResult(infos=(), judged=0, reset=False)
+    # 거래가 없는 구간은 캔들이 없으므로 받은 개수가 아니라 시각 차이로 센다
+    reset = last_done is not None and (latest - last_done) // timeframe.duration > MAX_MISSED_CANDLES
+    if last_done is None or reset:
+        states: Mapping[IndicatorType, IndicatorInfo] = {}
+        targets = [len(candles) - 1]
+    else:
+        states = previous
+        targets = [i for i, candle in enumerate(candles) if candle.start > last_done]
+    for i in targets:
+        window = candles[: i + 1]
+        states = judge_candle(
+            market_id=market_id,
+            candle_time=window[-1].start,
+            indicators=calculate(window, indicator_settings),
+            previous=states,
+            settings=signal_settings,
+            judge=len(window) >= MIN_CANDLES_FOR_SIGNAL,
+        )
+    return ReplayResult(infos=tuple(states.values()), judged=len(targets), reset=reset)
+
+
+def judge_candle(
     *,
     market_id: int,
     candle_time: datetime,
@@ -100,11 +152,10 @@ def next_indicator_infos(
     previous: Mapping[IndicatorType, IndicatorInfo],
     settings: SignalSettings,
     judge: bool,
-) -> list[IndicatorInfo]:
-    """판단할 캔들(candle_time)의 지표 값과 신호 상태 (매매 로직 4.1).
+) -> dict[IndicatorType, IndicatorInfo]:
+    """캔들 하나(candle_time)의 지표 값과 신호 상태 (매매 로직 4.1).
 
     이벤트가 없거나 판정하지 않으면(judge=False) 이전 상태를 그대로 둔다.
-    이미 이 캔들이나 더 새로운 캔들로 저장된 지표 타입은 다시 만들지 않는다.
     """
     # 지표 타입별 (값 목록, 과매도/과매수 기준, 과매도/과매수 판정에 시그널선도 쓰는지)
     sources: dict[IndicatorType, tuple[Line, Threshold | None, bool]] = {
@@ -114,11 +165,9 @@ def next_indicator_infos(
         IndicatorType.MACD_MID: (indicators.macd_mid, None, False),
         IndicatorType.MACD_LONG: (indicators.macd_long, None, False),
     }
-    infos = []
+    infos: dict[IndicatorType, IndicatorInfo] = {}
     for indicator_type, (line, threshold, with_signal) in sources.items():
         before = previous.get(indicator_type)
-        if before is not None and before.candle_time >= candle_time:
-            continue
         info = IndicatorInfo(
             market_id=market_id,
             indicator_type=indicator_type,
@@ -136,7 +185,7 @@ def next_indicator_infos(
                 info = replace(info, over_state=over_state, over_time=candle_time)
             if (cross_state := cross(line)) is not None:
                 info = replace(info, cross_state=cross_state, cross_time=candle_time)
-        infos.append(info)
+        infos[indicator_type] = info
     return infos
 
 

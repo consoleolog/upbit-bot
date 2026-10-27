@@ -1,5 +1,6 @@
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from unittest.mock import MagicMock
@@ -10,7 +11,14 @@ from src.candle import Candle
 from src.config import Timeframe
 from src.database import Database
 from src.indicators import Indicators, IndicatorSettings, Line, calculate
-from src.market_worker import MIN_CANDLES_FOR_SIGNAL, MarketWorker, next_indicator_infos
+from src.market_worker import (
+    MAX_MISSED_CANDLES,
+    MIN_CANDLES_FOR_SIGNAL,
+    MarketWorker,
+    ReplayResult,
+    judge_candle,
+    replay,
+)
 from src.repositories.indicator_info import IndicatorInfoRepository
 from src.repositories.market import MarketRepository
 from src.repositories.models import IndicatorInfo, IndicatorType
@@ -29,7 +37,7 @@ def _indicators(*, rsi: Line = FLAT, stochastic: Line = FLAT, macd: Line = FLAT)
 def _next(
     indicators: Indicators, previous: dict[IndicatorType, IndicatorInfo] | None = None, *, judge: bool = True
 ) -> dict[IndicatorType, IndicatorInfo]:
-    infos = next_indicator_infos(
+    return judge_candle(
         market_id=1,
         candle_time=T1,
         indicators=indicators,
@@ -37,7 +45,6 @@ def _next(
         settings=SignalSettings(),
         judge=judge,
     )
-    return {info.indicator_type: info for info in infos}
 
 
 def _previous(indicator_type: IndicatorType, candle_time: datetime = T0, **states: object) -> IndicatorInfo:
@@ -128,16 +135,6 @@ def test_without_judging_values_update_but_states_stay() -> None:
     assert (rsi.over_state, rsi.cross_state, rsi.cross_time) == (None, CrossState.DEAD_CROSS, T0)
 
 
-@pytest.mark.parametrize("saved_time", [T1, T1 + timedelta(minutes=30)])
-def test_already_processed_type_is_skipped(saved_time: datetime) -> None:
-    previous = {IndicatorType.RSI: _previous(IndicatorType.RSI, saved_time)}
-
-    infos = _next(_indicators(), previous)
-
-    assert IndicatorType.RSI not in infos
-    assert IndicatorType.STOCHASTIC in infos
-
-
 class FakeUpbit:
     def __init__(self, candles: list[Candle]) -> None:
         self.candles = candles
@@ -155,6 +152,110 @@ def _candles(market: str, count: int, close: datetime) -> list[Candle]:
         Candle(market=market, start=close - timedelta(minutes=30 * (count - i)), open=c, high=c + 1, low=c - 1, close=c)
         for i, c in enumerate(closes)
     ]
+
+
+CLOSE = datetime(2026, 1, 10, 0, 0, tzinfo=UTC)
+THIRTY = timedelta(minutes=30)
+
+
+def _replay(candles: list[Candle], previous: dict[IndicatorType, IndicatorInfo] | None = None) -> ReplayResult:
+    return replay(
+        market_id=1,
+        candles=candles,
+        previous=previous or {},
+        timeframe=Timeframe.MINUTE_30,
+        indicator_settings=IndicatorSettings(),
+        signal_settings=SignalSettings(),
+    )
+
+
+def _replay_by_hand(
+    candles: list[Candle], start: int, previous: dict[IndicatorType, IndicatorInfo]
+) -> dict[IndicatorType, IndicatorInfo]:
+    """기준: start번째 캔들부터 마지막까지, 각 캔들까지의 구간으로 차례로 판정한다."""
+    states: Mapping[IndicatorType, IndicatorInfo] = previous
+    for i in range(start, len(candles)):
+        window = candles[: i + 1]
+        states = judge_candle(
+            market_id=1,
+            candle_time=window[-1].start,
+            indicators=calculate(window, IndicatorSettings()),
+            previous=states,
+            settings=SignalSettings(),
+            judge=len(window) >= MIN_CANDLES_FOR_SIGNAL,
+        )
+    return states
+
+
+def _done_at(candle_time: datetime) -> dict[IndicatorType, IndicatorInfo]:
+    """candle_time까지 처리한 이전 상태. RSI에 지난 신호가 남아 있다."""
+    return {
+        t: _previous(t, candle_time)
+        if t is not IndicatorType.RSI
+        else _previous(t, candle_time, cross_state=CrossState.DEAD_CROSS, cross_time=candle_time)
+        for t in IndicatorType
+    }
+
+
+def test_replay_first_time_judges_only_last_candle() -> None:
+    candles = _candles("KRW-BTC", 200, CLOSE)
+
+    result = _replay(candles)
+
+    assert (result.judged, result.reset) == (1, False)
+    assert {info.indicator_type: info for info in result.infos} == _replay_by_hand(candles, 199, {})
+
+
+def test_replay_next_candle_judges_one() -> None:
+    candles = _candles("KRW-BTC", 200, CLOSE)
+    previous = _done_at(candles[-2].start)
+
+    result = _replay(candles, previous)
+
+    assert result.judged == 1
+    assert {info.indicator_type: info for info in result.infos} == _replay_by_hand(candles, 199, previous)
+
+
+@pytest.mark.parametrize("missed", [3, MAX_MISSED_CANDLES])
+def test_replay_missed_candles_oldest_first(missed: int) -> None:
+    candles = _candles("KRW-BTC", 200, CLOSE)
+    previous = _done_at(candles[-missed - 1].start)
+
+    result = _replay(candles, previous)
+
+    assert (result.judged, result.reset) == (missed, False)
+    infos = {info.indicator_type: info for info in result.infos}
+    assert infos == _replay_by_hand(candles, 200 - missed, previous)
+    assert all(info.candle_time == candles[-1].start for info in infos.values())
+
+
+def test_replay_too_many_missed_resets_states() -> None:
+    candles = _candles("KRW-BTC", 200, CLOSE)
+    previous = _done_at(candles[-MAX_MISSED_CANDLES - 2].start)
+
+    result = _replay(candles, previous)
+
+    assert (result.judged, result.reset) == (1, True)
+    # 지난 신호(RSI 데드크로스)는 남지 않고, 마지막 캔들만 새로 판정한다
+    assert {info.indicator_type: info for info in result.infos} == _replay_by_hand(candles, 199, {})
+
+
+def test_replay_counts_missed_by_time_not_by_received_candles() -> None:
+    # 거래가 없어 캔들이 드문드문 온다. 받은 캔들은 적지만 시각으로는 50개를 넘게 놓쳤다
+    candles = _candles("KRW-BTC", 200, CLOSE)
+    sparse = [*candles[:150], candles[-1]]
+    previous = _done_at(candles[-MAX_MISSED_CANDLES - 2].start)
+
+    assert _replay(sparse, previous).reset
+
+
+@pytest.mark.parametrize("offset", [0, 1])
+def test_replay_already_processed_does_nothing(offset: int) -> None:
+    candles = _candles("KRW-BTC", 200, CLOSE)
+
+    result = _replay(candles, _done_at(candles[-1].start + THIRTY * offset))
+
+    assert (result.infos, result.judged, result.reset) == ((), 0, False)
 
 
 def _worker(upbit: FakeUpbit, database: Database, market_ids: dict[str, int]) -> MarketWorker:
@@ -234,7 +335,7 @@ async def test_job_saves_indicators_and_signals(database: Database, market: tupl
 
     # 마감 시각을 to로 넘겨 마감된 캔들만 받는다
     assert upbit.calls == [(symbol, Timeframe.MINUTE_30, close)]
-    expected = next_indicator_infos(
+    expected = judge_candle(
         market_id=market_id,
         candle_time=candles[-1].start,
         indicators=calculate(candles, IndicatorSettings()),
@@ -242,7 +343,7 @@ async def test_job_saves_indicators_and_signals(database: Database, market: tupl
         settings=SignalSettings(),
         judge=True,
     )
-    assert await _saved(database, market_id) == {info.indicator_type: info for info in expected}
+    assert await _saved(database, market_id) == expected
 
 
 @pytest.mark.integration
@@ -284,3 +385,19 @@ async def test_too_few_candles_updates_values_but_keeps_states(database: Databas
     assert rsi.candle_time == candles[-1].start
     assert rsi.value == calculate(candles, IndicatorSettings()).rsi.main[-1]
     assert (rsi.over_state, rsi.over_time, rsi.cross_state) == (OverState.OVER_BOUGHT, earlier, None)
+
+
+@pytest.mark.integration
+async def test_job_replays_missed_candles(database: Database, market: tuple[str, int]) -> None:
+    symbol, market_id = market
+    candles = _candles(symbol, 200, CLOSE)
+    done = candles[-4].start
+    async with database.transaction() as conn:
+        for info in _done_at(done).values():
+            await IndicatorInfoRepository().save(conn, replace(info, market_id=market_id))
+
+    await _worker(FakeUpbit(candles), database, {symbol: market_id}).candle_close_job(symbol, CLOSE)()
+
+    previous = {t: replace(info, market_id=market_id) for t, info in _done_at(done).items()}
+    expected = _replay_by_hand(candles, 197, previous)
+    assert await _saved(database, market_id) == {t: replace(info, market_id=market_id) for t, info in expected.items()}
