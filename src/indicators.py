@@ -10,6 +10,7 @@ from decimal import Decimal
 
 import numpy as np
 import talib
+from numpy.lib.stride_tricks import sliding_window_view
 
 Series = tuple[float | None, ...]
 
@@ -47,6 +48,43 @@ def rsi(closes: Sequence[Decimal], period: int, signal: int) -> Line:
     flat = np.cumsum(values != values[0]) == 0 if len(values) else np.array([], dtype=bool)
     main[flat & ~np.isnan(main)] = 50.0
     return Line(main=_series(main), signal=_series(talib.EMA(main, signal)))
+
+
+def stochastic_slow(
+    highs: Sequence[Decimal],
+    lows: Sequence[Decimal],
+    closes: Sequence[Decimal],
+    k_len: int,
+    k_smooth: int,
+    d_smooth: int,
+) -> Line:
+    """slow 스토캐스틱. 메인선은 slow %K = SMA(fast %K, k_smooth), 시그널은 slow %D = SMA(slow %K, d_smooth) (매매 로직 3.3).
+
+    최근 k_len개의 최고가 = 최저가이면 그 캔들의 fast %K는 없고(None), 그 캔들이 들어간 평균도 없다.
+    TA-Lib은 이때 0을 주고, TA-Lib의 SMA는 값이 하나 없으면 그 뒤가 모두 없어지므로 numpy로 계산한다.
+    """
+    if k_len < 1 or k_smooth < 1 or d_smooth < 1:
+        raise ValueError(f"periods must be at least 1: {k_len}, {k_smooth}, {d_smooth}")
+    if not len(highs) == len(lows) == len(closes):
+        raise ValueError("highs, lows and closes must have the same length")
+    high, low, close = _floats(highs), _floats(lows), _floats(closes)
+    fast_k = np.full(len(close), np.nan)
+    if len(close) >= k_len:
+        highest = sliding_window_view(high, k_len).max(axis=1)
+        lowest = sliding_window_view(low, k_len).min(axis=1)
+        span = highest - lowest
+        with np.errstate(divide="ignore", invalid="ignore"):
+            fast_k[k_len - 1 :] = np.where(span > 0, (close[k_len - 1 :] - lowest) / span * 100, np.nan)
+    slow_k = _sma(fast_k, k_smooth)
+    return Line(main=_series(slow_k), signal=_series(_sma(slow_k, d_smooth)))
+
+
+def _sma(values: np.ndarray, period: int) -> np.ndarray:
+    """단순이동평균. 구간에 값이 없는(NaN) 자리가 있으면 그 구간의 평균도 없다."""
+    out = np.full(len(values), np.nan)
+    if len(values) >= period:
+        out[period - 1 :] = sliding_window_view(values, period).mean(axis=1)
+    return out
 
 
 def _floats(values: Sequence[Decimal]) -> np.ndarray:

@@ -3,7 +3,7 @@ from itertools import pairwise
 
 import pytest
 
-from src.indicators import Line, macd, rsi
+from src.indicators import Line, macd, rsi, stochastic_slow
 
 
 def _ema(values: list[float | None], period: int) -> list[float | None]:
@@ -136,3 +136,74 @@ def test_rsi_with_too_few_candles_is_all_none() -> None:
 def test_rsi_rejects_invalid_periods(period: int, signal: int) -> None:
     with pytest.raises(ValueError, match="periods"):
         rsi(_decimals(RSI_CLOSES), period=period, signal=signal)
+
+
+def _reference_stochastic(
+    highs: list[float], lows: list[float], closes: list[float], k_len: int, k_smooth: int, d_smooth: int
+) -> tuple[list[float | None], list[float | None]]:
+    """기준 구현 (매매 로직 3.3). 최고가 = 최저가이면 fast %K가 없고, 그 값이 들어간 평균도 없다."""
+
+    def sma(values: list[float | None], n: int) -> list[float | None]:
+        out: list[float | None] = [None] * len(values)
+        for i in range(n - 1, len(values)):
+            window = values[i - n + 1 : i + 1]
+            out[i] = None if None in window else sum(v for v in window if v is not None) / n
+        return out
+
+    fast: list[float | None] = [None] * len(closes)
+    for i in range(k_len - 1, len(closes)):
+        hi, lo = max(highs[i - k_len + 1 : i + 1]), min(lows[i - k_len + 1 : i + 1])
+        fast[i] = None if hi == lo else (closes[i] - lo) / (hi - lo) * 100
+    k = sma(fast, k_smooth)
+    return k, sma(k, d_smooth)
+
+
+HIGHS = [10, 12, 11, 14, 15, 13, 16, 15, 17, 18, 16, 15, 17, 19]
+LOWS = [8, 9, 9, 11, 12, 11, 13, 12, 14, 15, 13, 12, 14, 16]
+CLOSES_HL = [9, 11, 10, 13, 14, 12, 15, 13, 16, 17, 14, 13, 16, 18]
+
+
+def _stochastic(highs: list[float], lows: list[float], closes: list[float]) -> Line:
+    return stochastic_slow(_decimals(highs), _decimals(lows), _decimals(closes), k_len=4, k_smooth=2, d_smooth=3)
+
+
+def test_stochastic_matches_reference() -> None:
+    k, d = _reference_stochastic(HIGHS, LOWS, CLOSES_HL, 4, 2, 3)
+
+    line = _stochastic(HIGHS, LOWS, CLOSES_HL)
+
+    assert list(line.main) == _approx(k)
+    assert list(line.signal) == _approx(d)
+    # slow %K는 k_len + k_smooth - 1번째부터, slow %D는 그 뒤 d_smooth - 1개 뒤부터 값이 있다
+    assert line.main[3] is None and line.main[4] is not None
+    assert line.signal[5] is None and line.signal[6] is not None
+
+
+def test_stochastic_skips_candles_with_zero_range() -> None:
+    # 처음 6개 캔들은 고가 = 저가 = 종가로 범위가 0이다
+    highs = [10] * 6 + HIGHS[6:]
+    lows = [10] * 6 + LOWS[6:]
+    closes = [10] * 6 + CLOSES_HL[6:]
+    k, d = _reference_stochastic(highs, lows, closes, 4, 2, 3)
+
+    line = _stochastic(highs, lows, closes)
+
+    # TA-Lib은 범위가 0이면 0을 주지만, 매매 로직은 그 캔들을 갱신하지 않는다
+    assert list(line.main) == _approx(k)
+    assert list(line.signal) == _approx(d)
+    assert line.main[4] is None and line.main[5] is None
+    assert line.main[-1] is not None and line.signal[-1] is not None
+
+
+def test_stochastic_with_too_few_candles_is_all_none() -> None:
+    line = _stochastic(HIGHS[:3], LOWS[:3], CLOSES_HL[:3])
+
+    assert line.main == (None,) * 3
+    assert line.signal == (None,) * 3
+
+
+def test_stochastic_rejects_invalid_arguments() -> None:
+    with pytest.raises(ValueError, match="periods"):
+        stochastic_slow(_decimals(HIGHS), _decimals(LOWS), _decimals(CLOSES_HL), k_len=0, k_smooth=2, d_smooth=3)
+    with pytest.raises(ValueError, match="same length"):
+        stochastic_slow(_decimals(HIGHS), _decimals(LOWS[:-1]), _decimals(CLOSES_HL), k_len=4, k_smooth=2, d_smooth=3)
