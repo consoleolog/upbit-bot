@@ -1,0 +1,47 @@
+# 서버에서 DB와 봇을 함께 실행한다. 접속 정보는 같은 폴더의 .env(DB_NAME, DB_USER, DB_PASSWORD)에서 읽는다.
+# DB만 실행: docker compose up -d db
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
+services:
+  db:
+    image: postgres:16-bookworm
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${DB_NAME:?DB_NAME is required}
+      POSTGRES_USER: ${DB_USER:?DB_USER is required}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD is required}
+    volumes:
+      - db-data:/var/lib/postgresql/data
+      # 데이터가 비어 있을 때(처음 시작할 때)만 적용된다
+      - ./db/schema.sql:/docker-entrypoint-initdb.d/schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    # 포트를 서버 밖으로 열지 않는다. 봇은 compose 내부 네트워크로만 접속한다
+    logging: *logging
+
+  bot:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DB_HOST: db
+      DB_PORT: "5432"
+      DB_NAME: ${DB_NAME}
+      DB_USER: ${DB_USER}
+      DB_PASSWORD: ${DB_PASSWORD}
+    volumes:
+      - ./config/trading.json:/app/config/trading.json:ro
+    logging: *logging
+
+volumes:
+  db-data:
