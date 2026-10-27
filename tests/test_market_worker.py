@@ -24,6 +24,8 @@ from src.repositories.market import MarketRepository
 from src.repositories.models import IndicatorInfo, IndicatorType
 from src.signals import CrossState, OverState, SignalSettings
 
+MACD_TYPES = (IndicatorType.MACD_SHORT, IndicatorType.MACD_MID, IndicatorType.MACD_LONG)
+
 T0 = datetime(2026, 1, 1, 0, 0, tzinfo=UTC)
 T1 = T0 + timedelta(minutes=30)
 # 과매도·과매수 기준 사이에서 두 선이 겹쳐 아무 이벤트도 없는 값
@@ -133,6 +135,72 @@ def test_without_judging_values_update_but_states_stay() -> None:
 
     assert (rsi.value, rsi.candle_time) == (20.0, T1)
     assert (rsi.over_state, rsi.cross_state, rsi.cross_time) == (None, CrossState.DEAD_CROSS, T0)
+
+
+DEAD = Line(main=(2.0, 1.0), signal=(1.5, 1.5))
+
+
+def _rsi_and_stochastic_with_states() -> dict[IndicatorType, IndicatorInfo]:
+    states = {
+        "over_state": OverState.OVER_SOLD,
+        "over_time": T0,
+        "cross_state": CrossState.GOLDEN_CROSS,
+        "cross_time": T0,
+    }
+    return {t: _previous(t, **states) for t in (IndicatorType.RSI, IndicatorType.STOCHASTIC)}
+
+
+def test_macd_all_dead_resets_rsi_and_stochastic_states() -> None:
+    infos = _next(_indicators(macd=DEAD), _rsi_and_stochastic_with_states())
+
+    for indicator_type in (IndicatorType.RSI, IndicatorType.STOCHASTIC):
+        info = infos[indicator_type]
+        assert (info.over_state, info.over_time, info.cross_state, info.cross_time) == (None, None, None, None)
+        # 지표 값은 그대로 갱신한다
+        assert (info.value, info.candle_time) == (50.0, T1)
+    assert all(infos[t].cross_state == CrossState.DEAD_CROSS for t in MACD_TYPES)
+
+
+def test_macd_reset_when_last_one_turns_dead() -> None:
+    previous = _rsi_and_stochastic_with_states() | {
+        IndicatorType.MACD_SHORT: _previous(IndicatorType.MACD_SHORT, cross_state=CrossState.DEAD_CROSS, cross_time=T0),
+        IndicatorType.MACD_MID: _previous(IndicatorType.MACD_MID, cross_state=CrossState.DEAD_CROSS, cross_time=T0),
+        IndicatorType.MACD_LONG: _previous(IndicatorType.MACD_LONG, cross_state=CrossState.GOLDEN_CROSS, cross_time=T0),
+    }
+
+    # 이미 데드크로스였던 둘은 상태가 그대로이고, MACD_LONG만 골든크로스에서 데드크로스로 바뀐다
+    infos = _next(_indicators(macd=DEAD), previous)
+
+    assert infos[IndicatorType.RSI].cross_state is None
+    assert infos[IndicatorType.STOCHASTIC].over_state is None
+
+
+def test_macd_staying_dead_does_not_reset_again() -> None:
+    dead = {"cross_state": CrossState.DEAD_CROSS, "cross_time": T0}
+    previous = _rsi_and_stochastic_with_states() | {t: _previous(t, **dead) for t in MACD_TYPES}
+
+    infos = _next(_indicators(macd=DEAD), previous)
+
+    assert infos[IndicatorType.RSI].over_state == OverState.OVER_SOLD
+    assert infos[IndicatorType.STOCHASTIC].cross_state == CrossState.GOLDEN_CROSS
+
+
+def test_macd_partly_dead_does_not_reset() -> None:
+    previous = _rsi_and_stochastic_with_states() | {
+        IndicatorType.MACD_LONG: _previous(IndicatorType.MACD_LONG, cross_state=CrossState.GOLDEN_CROSS, cross_time=T0)
+    }
+    # MACD_SHORT, MACD_MID만 데드크로스. MACD_LONG은 골든크로스 상태를 유지
+    indicators = Indicators(macd_short=DEAD, macd_mid=DEAD, macd_long=FLAT, rsi=FLAT, stochastic=FLAT)
+
+    infos = _next(indicators, previous)
+
+    assert infos[IndicatorType.RSI].over_state == OverState.OVER_SOLD
+
+
+def test_without_judging_macd_does_not_reset() -> None:
+    infos = _next(_indicators(macd=DEAD), _rsi_and_stochastic_with_states(), judge=False)
+
+    assert infos[IndicatorType.RSI].over_state == OverState.OVER_SOLD
 
 
 class FakeUpbit:
