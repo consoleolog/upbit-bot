@@ -1,7 +1,11 @@
 import asyncio
+from datetime import UTC, datetime
+from decimal import Decimal
 from typing import Any, Literal
 
 import httpx
+
+from src.candle import Candle
 
 BASE_URL = "https://api.upbit.com"
 
@@ -9,6 +13,9 @@ BASE_URL = "https://api.upbit.com"
 DEFAULT_TIMEOUT = 5.0
 
 Method = Literal["GET", "POST"]
+
+# 업비트 candle_date_time_utc 형식. 시간대 표시가 없는 UTC 시각이다
+CANDLE_TIME_FORMAT = "%Y-%m-%dT%H:%M:%S"
 
 
 class UpbitError(Exception):
@@ -156,3 +163,29 @@ def _parse_error_body(response: httpx.Response) -> tuple[str | None, str]:
         name = error.get("name")
         return (str(name) if name is not None else None), str(error.get("message", ""))
     return None, response.text[:200]
+
+
+def _parse_candle(raw: object) -> Candle:
+    """업비트 캔들 응답 한 건을 Candle로 바꾼다. 형식이나 값이 잘못되면 UpbitResponseError."""
+    try:
+        if not isinstance(raw, dict) or not isinstance(raw["market"], str):
+            raise TypeError("candle must be an object with a market code")
+        start = datetime.strptime(raw["candle_date_time_utc"], CANDLE_TIME_FORMAT).replace(tzinfo=UTC)
+        open_, high, low, close = (
+            _price(raw[key]) for key in ("opening_price", "high_price", "low_price", "trade_price")
+        )
+        if not low <= min(open_, close) <= max(open_, close) <= high:
+            raise ValueError("prices must satisfy low <= open, close <= high")
+    except (KeyError, TypeError, ValueError) as error:
+        raise UpbitResponseError(f"invalid upbit candle: {raw!r}") from error
+    return Candle(market=raw["market"], start=start, open=open_, high=high, low=low, close=close)
+
+
+def _price(value: object) -> Decimal:
+    # bool은 int의 하위 타입이라 따로 막는다. float는 문자열을 거쳐 표기된 값 그대로 바꾼다
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise TypeError(f"price must be a number: {value!r}")
+    price = Decimal(str(value))
+    if not price.is_finite() or price <= 0:
+        raise ValueError(f"price must be positive: {value!r}")
+    return price
