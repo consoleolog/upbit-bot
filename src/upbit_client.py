@@ -8,6 +8,7 @@ import httpx
 
 from src.candle import Candle
 from src.config import Timeframe
+from src.rate_limiter import RateLimiter
 
 BASE_URL = "https://api.upbit.com"
 
@@ -20,6 +21,9 @@ Method = Literal["GET", "POST"]
 CANDLE_TIME_FORMAT = "%Y-%m-%dT%H:%M:%S"
 # 업비트가 캔들을 한 번에 주는 최대 개수
 MAX_CANDLES = 200
+# 캔들 조회의 초당 요청 수. 업비트 Remaining-Req 헤더 기준 한도는 초당 10회(candles 그룹, IP별)이고,
+# 우리와 업비트가 1초를 재는 시점이 어긋날 수 있어 여유를 둔다. 여유분은 근거 있는 값이 아니다
+CANDLE_REQUESTS_PER_SECOND = 8
 # 업비트 캔들 경계는 UTC 기준으로 timeframe마다 나뉜다 (실제 응답으로 확인)
 EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 
@@ -100,6 +104,7 @@ class UpbitClient:
         timeout: float = DEFAULT_TIMEOUT,
         transport: httpx.AsyncBaseTransport | None = None,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
+        candle_limiter: RateLimiter | None = None,
     ) -> None:
         if timeout <= 0:
             raise ValueError("timeout must be positive")
@@ -107,6 +112,7 @@ class UpbitClient:
         self._timeout = timeout
         self._transport = transport
         self._clock = clock
+        self._candle_limiter = candle_limiter or RateLimiter(CANDLE_REQUESTS_PER_SECOND)
         self._http: httpx.AsyncClient | None = None
 
     async def open(self) -> None:
@@ -143,6 +149,7 @@ class UpbitClient:
             raise ValueError(f"count must be between 1 and {MAX_CANDLES}")
         minutes = int(timeframe.duration.total_seconds()) // 60
         params = {"market": market, "count": count, "to": to.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")}
+        await self._candle_limiter.acquire()
         raw = await self._request("GET", f"/v1/candles/minutes/{minutes}", params)
         if not isinstance(raw, list) or len(raw) > count:
             raise UpbitResponseError(f"unexpected candle response for {market}: {type(raw).__name__}")
