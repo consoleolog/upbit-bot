@@ -1,10 +1,13 @@
 import asyncio
 from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime
+from decimal import Decimal
 from typing import Any
 
 import httpx
 import pytest
 
+from src.candle import Candle
 from src.upbit_client import (
     Method,
     UpbitAuthError,
@@ -18,6 +21,7 @@ from src.upbit_client import (
     UpbitServerError,
     UpbitTimeoutError,
     UpbitUnknownResultError,
+    _parse_candle,
 )
 
 Handler = Callable[[httpx.Request], httpx.Response | Awaitable[httpx.Response]]
@@ -237,3 +241,69 @@ async def test_error_with_invalid_utf8_body_keeps_status_error() -> None:
         await _request(handler)
 
     assert exc_info.value.name is None
+
+
+def _raw_candle(**overrides: object) -> dict[str, object]:
+    raw: dict[str, object] = {
+        "market": "KRW-BTC",
+        "candle_date_time_utc": "2026-01-01T00:30:00",
+        "candle_date_time_kst": "2026-01-01T09:30:00",
+        "opening_price": 100.0,
+        "high_price": 120.0,
+        "low_price": 90.0,
+        "trade_price": 110.0,
+    }
+    raw.update(overrides)
+    return raw
+
+
+def test_parse_candle() -> None:
+    assert _parse_candle(_raw_candle()) == Candle(
+        market="KRW-BTC",
+        start=datetime(2026, 1, 1, 0, 30, tzinfo=UTC),
+        open=Decimal("100.0"),
+        high=Decimal("120.0"),
+        low=Decimal("90.0"),
+        close=Decimal("110.0"),
+    )
+
+
+def test_parse_candle_keeps_written_float_value() -> None:
+    price = 0.0001234
+    candle = _parse_candle(_raw_candle(opening_price=price, high_price=price, low_price=price, trade_price=price))
+
+    # Decimal(0.0001234)처럼 바로 바꾸면 이진 부동소수점 오차가 그대로 들어간다
+    assert candle.close == Decimal("0.0001234")
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"market": None},
+        {"market": 1},
+        {"candle_date_time_utc": None},
+        {"candle_date_time_utc": 20260101},
+        {"candle_date_time_utc": "not a time"},
+        {"candle_date_time_utc": "2026-01-01"},
+        {"candle_date_time_utc": "2026-01-01T00:30:00+09:00"},
+        {"candle_date_time_utc": "2026-01-01T00:30:00Z"},
+        {"trade_price": None},
+        {"trade_price": "110.0"},
+        {"trade_price": True},
+        {"trade_price": 0},
+        {"trade_price": -1},
+        {"trade_price": float("nan")},
+        {"trade_price": float("inf")},
+        {"low_price": 115.0},
+        {"high_price": 105.0},
+    ],
+)
+def test_parse_candle_rejects_invalid(overrides: dict[str, object]) -> None:
+    with pytest.raises(UpbitResponseError, match="invalid upbit candle"):
+        _parse_candle(_raw_candle(**overrides))
+
+
+@pytest.mark.parametrize("raw", [None, [], "KRW-BTC", {"market": "KRW-BTC"}])
+def test_parse_candle_rejects_wrong_shape(raw: object) -> None:
+    with pytest.raises(UpbitResponseError, match="invalid upbit candle"):
+        _parse_candle(raw)
