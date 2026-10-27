@@ -118,7 +118,8 @@ def replay(
 ) -> ReplayResult:
     """마지막으로 처리한 캔들 이후의 마감 캔들을 오래된 것부터 하나씩 판정한다 (매매 로직 3.0).
 
-    처음 처리하면 마지막 캔들만 판정한다. 놓친 캔들이 MAX_MISSED_CANDLES를 넘으면 신호 상태를 비우고 마지막 캔들만 판정한다.
+    처음 처리하면 최근 MAX_MISSED_CANDLES개를 놓친 것으로 보고 판정해, 그동안 실제로 발생한 신호로 상태를 채운다.
+    놓친 캔들이 MAX_MISSED_CANDLES를 넘으면 신호 상태를 비우고 마지막 캔들만 판정한다.
     각 캔들의 지표는 받은 캔들 중 그 캔들까지의 구간으로 계산한다. 이미 모두 처리했으면 infos는 비어 있다.
     """
     last_done = max((info.candle_time for info in previous.values()), default=None)
@@ -127,8 +128,11 @@ def replay(
         return ReplayResult(infos=(), judged=0, reset=False)
     # 거래가 없는 구간은 캔들이 없으므로 받은 개수가 아니라 시각 차이로 센다
     reset = last_done is not None and (latest - last_done) // timeframe.duration > MAX_MISSED_CANDLES
-    if last_done is None or reset:
+    if last_done is None:
         states: Mapping[IndicatorType, IndicatorInfo] = {}
+        targets = list(range(max(len(candles) - MAX_MISSED_CANDLES, 0), len(candles)))
+    elif reset:
+        states = {}
         targets = [len(candles) - 1]
     else:
         states = previous

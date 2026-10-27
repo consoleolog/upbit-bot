@@ -265,13 +265,26 @@ def _done_at(candle_time: datetime) -> dict[IndicatorType, IndicatorInfo]:
     }
 
 
-def test_replay_first_time_judges_only_last_candle() -> None:
+def test_replay_first_time_judges_recent_candles() -> None:
     candles = _candles("KRW-BTC", 200, CLOSE)
 
     result = _replay(candles)
 
-    assert (result.judged, result.reset) == (1, False)
-    assert {info.indicator_type: info for info in result.infos} == _replay_by_hand(candles, 199, {})
+    # 최근 50개를 놓친 것으로 보고 오래된 것부터 판정해, 그동안 발생한 신호로 상태를 채운다
+    assert (result.judged, result.reset) == (MAX_MISSED_CANDLES, False)
+    infos = {info.indicator_type: info for info in result.infos}
+    assert infos == _replay_by_hand(candles, 200 - MAX_MISSED_CANDLES, {})
+    assert any(info.cross_state is not None for info in infos.values())
+
+
+def test_replay_first_time_with_few_candles_judges_all() -> None:
+    candles = _candles("KRW-BTC", 30, CLOSE)
+
+    result = _replay(candles)
+
+    # 받은 캔들이 50개보다 적으면 모두 판정한다. 150개 미만이라 값만 갱신하고 신호는 판정하지 않는다
+    assert result.judged == 30
+    assert all(info.over_state is None and info.cross_state is None for info in result.infos)
 
 
 def test_replay_next_candle_judges_one() -> None:
@@ -403,15 +416,8 @@ async def test_job_saves_indicators_and_signals(database: Database, market: tupl
 
     # 마감 시각을 to로 넘겨 마감된 캔들만 받는다
     assert upbit.calls == [(symbol, Timeframe.MINUTE_30, close)]
-    expected = judge_candle(
-        market_id=market_id,
-        candle_time=candles[-1].start,
-        indicators=calculate(candles, IndicatorSettings()),
-        previous={},
-        settings=SignalSettings(),
-        judge=True,
-    )
-    assert await _saved(database, market_id) == expected
+    expected = _replay_by_hand(candles, 200 - MAX_MISSED_CANDLES, {})
+    assert await _saved(database, market_id) == {t: replace(info, market_id=market_id) for t, info in expected.items()}
 
 
 @pytest.mark.integration
