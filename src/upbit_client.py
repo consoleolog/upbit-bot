@@ -1,4 +1,5 @@
 import asyncio
+from collections.abc import Callable
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any, Literal
@@ -6,6 +7,7 @@ from typing import Any, Literal
 import httpx
 
 from src.candle import Candle
+from src.config import Timeframe
 
 BASE_URL = "https://api.upbit.com"
 
@@ -16,6 +18,10 @@ Method = Literal["GET", "POST"]
 
 # 업비트 candle_date_time_utc 형식. 시간대 표시가 없는 UTC 시각이다
 CANDLE_TIME_FORMAT = "%Y-%m-%dT%H:%M:%S"
+# 업비트가 캔들을 한 번에 주는 최대 개수
+MAX_CANDLES = 200
+# 업비트 캔들 경계는 UTC 기준으로 timeframe마다 나뉜다 (실제 응답으로 확인)
+EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 
 
 class UpbitError(Exception):
@@ -93,12 +99,14 @@ class UpbitClient:
         base_url: str = BASE_URL,
         timeout: float = DEFAULT_TIMEOUT,
         transport: httpx.AsyncBaseTransport | None = None,
+        clock: Callable[[], datetime] = lambda: datetime.now(UTC),
     ) -> None:
         if timeout <= 0:
             raise ValueError("timeout must be positive")
         self._base_url = base_url
         self._timeout = timeout
         self._transport = transport
+        self._clock = clock
         self._http: httpx.AsyncClient | None = None
 
     async def open(self) -> None:
@@ -111,6 +119,32 @@ class UpbitClient:
         if self._http is not None:
             http, self._http = self._http, None
             await http.aclose()
+
+    async def get_candles(
+        self, market: str, timeframe: Timeframe, to: datetime, count: int = MAX_CANDLES
+    ) -> list[Candle]:
+        """to 이전에 시작한 캔들을 과거 → 최신 순으로 최대 count개 돌려준다.
+
+        업비트는 진행 중인 캔들도 주므로, to에 마감 시각을 넘겨 마감된 캔들만 받는다 (to는 포함하지 않음).
+        """
+        if to.tzinfo is None:
+            raise ValueError("to must be timezone-aware")
+        # 경계가 아니거나 미래인 to를 넘기면 start < to인 진행 중인 캔들이 섞인다
+        if (to - EPOCH) % timeframe.duration or to > self._clock():
+            raise ValueError(f"to must be a past {timeframe} candle boundary: {to.isoformat()}")
+        if not 1 <= count <= MAX_CANDLES:
+            raise ValueError(f"count must be between 1 and {MAX_CANDLES}")
+        minutes = int(timeframe.duration.total_seconds()) // 60
+        params = {"market": market, "count": count, "to": to.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")}
+        raw = await self._request("GET", f"/v1/candles/minutes/{minutes}", params)
+        if not isinstance(raw, list) or len(raw) > count:
+            raise UpbitResponseError(f"unexpected candle response for {market}: {type(raw).__name__}")
+        candles = sorted((_parse_candle(item) for item in raw), key=lambda candle: candle.start)
+        for previous, candle in zip([None, *candles], candles, strict=False):
+            # 같은 시각의 캔들이 두 번 오면 지표 계산에 두 번 들어간다
+            if candle.market != market or candle.start >= to or (previous and previous.start == candle.start):
+                raise UpbitResponseError(f"candle does not match request ({market}, to={to.isoformat()}): {candle}")
+        return candles
 
     async def _request(self, method: Method, path: str, params: dict[str, Any] | None = None) -> Any:
         """요청을 보내고 JSON 응답을 돌려준다. 실패하면 UpbitError. 재시도하지 않는다."""

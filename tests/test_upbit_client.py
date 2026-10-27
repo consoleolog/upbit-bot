@@ -7,7 +7,8 @@ from typing import Any
 import httpx
 import pytest
 
-from src.candle import Candle
+from src.candle import KST, Candle
+from src.config import Timeframe
 from src.upbit_client import (
     Method,
     UpbitAuthError,
@@ -307,3 +308,138 @@ def test_parse_candle_rejects_invalid(overrides: dict[str, object]) -> None:
 def test_parse_candle_rejects_wrong_shape(raw: object) -> None:
     with pytest.raises(UpbitResponseError, match="invalid upbit candle"):
         _parse_candle(raw)
+
+
+TO = datetime(2026, 1, 1, 1, 0, tzinfo=UTC)
+
+
+async def _get_candles(
+    response: object, timeframe: Timeframe = Timeframe.MINUTE_30, count: int = 200, to: datetime = TO
+) -> tuple[list[Candle], httpx.Request]:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json=response)
+
+    client = UpbitClient(transport=httpx.MockTransport(handler))
+    await client.open()
+    try:
+        return await client.get_candles("KRW-BTC", timeframe, to, count), seen[0]
+    finally:
+        await client.close()
+
+
+async def test_get_candles_returns_oldest_first() -> None:
+    # 업비트는 최신 → 과거 순으로 준다
+    response = [
+        _raw_candle(candle_date_time_utc="2026-01-01T00:30:00"),
+        _raw_candle(candle_date_time_utc="2026-01-01T00:00:00"),
+    ]
+
+    candles, request = await _get_candles(response)
+
+    assert [candle.start for candle in candles] == [
+        datetime(2026, 1, 1, 0, 0, tzinfo=UTC),
+        datetime(2026, 1, 1, 0, 30, tzinfo=UTC),
+    ]
+    assert request.url.path == "/v1/candles/minutes/30"
+    assert dict(request.url.params) == {"market": "KRW-BTC", "count": "200", "to": "2026-01-01T01:00:00Z"}
+
+
+@pytest.mark.parametrize(("timeframe", "unit"), [(Timeframe.MINUTE_1, "1"), (Timeframe.MINUTE_240, "240")])
+async def test_get_candles_uses_timeframe_unit(timeframe: Timeframe, unit: str) -> None:
+    # 00:00(UTC)은 1분봉과 240분봉 모두의 경계다
+    _, request = await _get_candles([], timeframe=timeframe, to=datetime(2026, 1, 1, tzinfo=UTC))
+
+    assert request.url.path == f"/v1/candles/minutes/{unit}"
+
+
+async def test_get_candles_sends_to_in_utc() -> None:
+    seen: list[httpx.Request] = []
+    client = UpbitClient(
+        transport=httpx.MockTransport(lambda request: seen.append(request) or httpx.Response(200, json=[]))
+    )
+    await client.open()
+    await client.get_candles("KRW-BTC", Timeframe.MINUTE_30, TO.astimezone(KST))
+    await client.close()
+
+    assert seen[0].url.params["to"] == "2026-01-01T01:00:00Z"
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        {"error": "not a list"},
+        [_raw_candle(market="KRW-ETH")],
+        # to 이후에 시작한 캔들(진행 중인 캔들 등)이 섞이면 안 된다
+        [_raw_candle(candle_date_time_utc="2026-01-01T01:00:00")],
+        [_raw_candle(candle_date_time_utc="2026-01-01T01:30:00")],
+        [_raw_candle(trade_price=None)],
+    ],
+)
+async def test_get_candles_rejects_unexpected_response(response: object) -> None:
+    with pytest.raises(UpbitResponseError):
+        await _get_candles(response)
+
+
+async def test_get_candles_rejects_more_than_requested() -> None:
+    response = [
+        _raw_candle(candle_date_time_utc="2026-01-01T00:30:00"),
+        _raw_candle(candle_date_time_utc="2026-01-01T00:00:00"),
+    ]
+
+    with pytest.raises(UpbitResponseError):
+        await _get_candles(response, count=1)
+
+
+@pytest.mark.parametrize(("to", "count"), [(datetime(2026, 1, 1, 1, 0), 200), (TO, 0), (TO, 201)])
+async def test_get_candles_rejects_invalid_arguments(to: datetime, count: int) -> None:
+    client = UpbitClient(transport=httpx.MockTransport(lambda request: httpx.Response(200, json=[])))
+    await client.open()
+    try:
+        with pytest.raises(ValueError):
+            await client.get_candles("KRW-BTC", Timeframe.MINUTE_30, to, count)
+    finally:
+        await client.close()
+
+
+async def test_get_candles_rejects_duplicate_candles() -> None:
+    response = [
+        _raw_candle(candle_date_time_utc="2026-01-01T00:30:00"),
+        _raw_candle(candle_date_time_utc="2026-01-01T00:30:00"),
+    ]
+
+    with pytest.raises(UpbitResponseError):
+        await _get_candles(response)
+
+
+@pytest.mark.parametrize(
+    "to",
+    [
+        # 캔들 경계가 아니면 진행 중인 캔들이 섞인다
+        datetime(2026, 1, 1, 1, 0, 30, tzinfo=UTC),
+        datetime(2026, 1, 1, 1, 15, tzinfo=UTC),
+        # 아직 오지 않은 마감 시각
+        datetime(2026, 1, 1, 1, 30, tzinfo=UTC),
+    ],
+)
+async def test_get_candles_rejects_unsafe_to(to: datetime) -> None:
+    now = datetime(2026, 1, 1, 1, 10, tzinfo=UTC)
+    client = UpbitClient(transport=httpx.MockTransport(lambda request: httpx.Response(200, json=[])), clock=lambda: now)
+    await client.open()
+    try:
+        with pytest.raises(ValueError, match="past 30m candle boundary"):
+            await client.get_candles("KRW-BTC", Timeframe.MINUTE_30, to)
+    finally:
+        await client.close()
+
+
+async def test_get_candles_accepts_boundary_that_just_passed() -> None:
+    now = datetime(2026, 1, 1, 1, 0, 0, 60_000, tzinfo=UTC)
+    client = UpbitClient(transport=httpx.MockTransport(lambda request: httpx.Response(200, json=[])), clock=lambda: now)
+    await client.open()
+    try:
+        assert await client.get_candles("KRW-BTC", Timeframe.MINUTE_30, TO) == []
+    finally:
+        await client.close()
