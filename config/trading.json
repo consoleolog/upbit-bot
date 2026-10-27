@@ -1,4 +1,23 @@
 {
   "timeframe": "30m",
-  "markets": ["KRW-BTC", "KRW-ETH", "KRW-XRP"]
+  "markets": ["KRW-BTC", "KRW-ETH", "KRW-XRP"],
+  "indicator": {
+    "ema": { "short": 5, "mid": 8, "long": 13 },
+    "macd_signal": 9,
+    "rsi": { "period": 14, "signal": 9 },
+    "stochastic": { "k_len": 14, "k_smooth": 3, "d_smooth": 4 }
+  },
+  "threshold": {
+    "rsi": { "over_sold": 31, "over_bought": 60 },
+    "stochastic": { "over_sold": 25, "over_bought": 75 },
+    "stochastic_entry_max": 50
+  },
+  "order": {
+    "buy_ratio": 10.0
+  },
+  "exit": {
+    "take_profit_rate": 1.5,
+    "stop_loss_rate": 3.0,
+    "min_profit_rate": 0.5
+  }
 }
