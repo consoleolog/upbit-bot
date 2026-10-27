@@ -1,4 +1,4 @@
-"""보조지표 계산. TA-Lib을 쓰는 유일한 모듈이다.
+"""보조지표 계산. TA-Lib을 쓰는 유일한 모듈이다. 매매 로직과 정의가 다른 경계 사례는 여기서 맞춘다.
 
 입력은 마감된 캔들의 값, 출력은 입력과 같은 길이의 값 목록이며 아직 계산되지 않은 자리는 None이다.
 지표 값은 근사값이라 float로 둔다.
@@ -31,6 +31,21 @@ def macd(closes: Sequence[Decimal], fast: int, slow: int, signal: int) -> Line:
         raise ValueError(f"periods must satisfy 1 <= fast < slow and signal >= 1: {fast}, {slow}, {signal}")
     values = _floats(closes)
     main = talib.EMA(values, fast) - talib.EMA(values, slow)
+    return Line(main=_series(main), signal=_series(talib.EMA(main, signal)))
+
+
+def rsi(closes: Sequence[Decimal], period: int, signal: int) -> Line:
+    """Wilder 방식 RSI와 시그널 = RSI의 EMA(signal) (매매 로직 3.2).
+
+    가격 변동이 전혀 없으면(상승·하락 평균이 모두 0) 50이다. TA-Lib은 이때 0을 준다.
+    Wilder 평균은 한 번 변동이 생기면 0으로 돌아가지 않으므로, 변동이 없는 자리는 처음부터 종가가 모두 같은 자리뿐이다.
+    """
+    if period < 1 or signal < 1:
+        raise ValueError(f"periods must be at least 1: {period}, {signal}")
+    values = _floats(closes)
+    main = talib.RSI(values, period)
+    flat = np.cumsum(values != values[0]) == 0 if len(values) else np.array([], dtype=bool)
+    main[flat & ~np.isnan(main)] = 50.0
     return Line(main=_series(main), signal=_series(talib.EMA(main, signal)))
 
 
