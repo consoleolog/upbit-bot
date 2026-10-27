@@ -259,3 +259,19 @@ def test_default_settings_follow_trading_logic() -> None:
         stochastic_k_smooth=3,
         stochastic_d_smooth=4,
     )
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"rsi_period": 0},
+        {"stochastic_d_smooth": -1},
+        {"macd_signal": 1.5},
+        {"rsi_signal": True},
+        {"ema_short": 8, "ema_mid": 5},
+        {"ema_mid": 13, "ema_long": 13},
+    ],
+)
+def test_invalid_settings_rejected_on_creation(overrides: dict[str, object]) -> None:
+    with pytest.raises(ValueError, match="periods"):
+        IndicatorSettings(**overrides)  # type: ignore[arg-type]
