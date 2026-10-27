@@ -39,6 +39,16 @@ class IndicatorSettings:
     stochastic_k_smooth: int = 3
     stochastic_d_smooth: int = 4
 
+    def __post_init__(self) -> None:
+        # 잘못된 기간을 받으면 캔들 마감 때마다 계산이 실패하므로, 만들 때 바로 막는다
+        periods = vars(self)
+        if any(not isinstance(value, int) or isinstance(value, bool) or value < 1 for value in periods.values()):
+            raise ValueError(f"indicator periods must be positive integers: {periods}")
+        if not self.ema_short < self.ema_mid < self.ema_long:
+            raise ValueError(
+                f"ema periods must satisfy short < mid < long: {self.ema_short}, {self.ema_mid}, {self.ema_long}"
+            )
+
 
 @dataclass(frozen=True, kw_only=True)
 class Indicators:
