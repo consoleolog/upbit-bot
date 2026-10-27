@@ -11,7 +11,7 @@ from src.database import Database
 from src.indicators import Indicators, IndicatorSettings, Line, calculate
 from src.repositories.indicator_info import IndicatorInfoRepository
 from src.repositories.models import IndicatorInfo, IndicatorType
-from src.signals import SignalSettings, Threshold, cross, over
+from src.signals import CrossState, SignalSettings, Threshold, cross, over
 
 logger = logging.getLogger(__name__)
 
@@ -19,6 +19,8 @@ logger = logging.getLogger(__name__)
 MIN_CANDLES_FOR_SIGNAL = 150
 # 놓친 캔들이 이보다 많으면 그 사이의 신호는 이미 지난 것으로 보고 상태를 비운다 (매매 로직 3.0)
 MAX_MISSED_CANDLES = 50
+
+MACD_TYPES = (IndicatorType.MACD_SHORT, IndicatorType.MACD_MID, IndicatorType.MACD_LONG)
 
 
 class CandleSource(Protocol):
@@ -153,9 +155,10 @@ def judge_candle(
     settings: SignalSettings,
     judge: bool,
 ) -> dict[IndicatorType, IndicatorInfo]:
-    """캔들 하나(candle_time)의 지표 값과 신호 상태 (매매 로직 4.1).
+    """캔들 하나(candle_time)의 지표 값과 신호 상태 (매매 로직 4.1, 7).
 
     이벤트가 없거나 판정하지 않으면(judge=False) 이전 상태를 그대로 둔다.
+    MACD 3종이 모두 데드크로스가 되면 RSI와 스토캐스틱의 신호 상태를 비운다.
     """
     # 지표 타입별 (값 목록, 과매도/과매수 기준, 과매도/과매수 판정에 시그널선도 쓰는지)
     sources: dict[IndicatorType, tuple[Line, Threshold | None, bool]] = {
@@ -186,7 +189,25 @@ def judge_candle(
             if (cross_state := cross(line)) is not None:
                 info = replace(info, cross_state=cross_state, cross_time=candle_time)
         infos[indicator_type] = info
+    if _macd_turned_all_dead(previous, infos):
+        for indicator_type in (IndicatorType.RSI, IndicatorType.STOCHASTIC):
+            infos[indicator_type] = replace(
+                infos[indicator_type], over_state=None, over_time=None, cross_state=None, cross_time=None
+            )
     return infos
+
+
+def _macd_turned_all_dead(
+    previous: Mapping[IndicatorType, IndicatorInfo], current: Mapping[IndicatorType, IndicatorInfo]
+) -> bool:
+    """MACD 3종이 모두 데드크로스이고, 그중 하나라도 이번 캔들에서 데드크로스가 됐는지 (매매 로직 7).
+
+    데드크로스가 이어지는 동안 매 캔들 초기화를 반복하지 않기 위해 바뀐 경우만 본다.
+    """
+    dead = CrossState.DEAD_CROSS
+    if any(current[t].cross_state != dead for t in MACD_TYPES):
+        return False
+    return any(t not in previous or previous[t].cross_state != dead for t in MACD_TYPES)
 
 
 def _describe(info: IndicatorInfo) -> str:
