@@ -1,3 +1,4 @@
+import uuid
 from pathlib import Path
 
 import pytest
@@ -5,7 +6,8 @@ from pytest_mock import MockerFixture
 
 from src.application import Application
 from src.config import Timeframe, TradingConfig
-from src.main import EXIT_OK, EXIT_STARTUP_FAILED, main, parse_args, run
+from src.database import Database, DatabaseConfig
+from src.main import EXIT_OK, EXIT_STARTUP_FAILED, main, parse_args, register_markets, run
 
 
 def test_parse_args_reads_config_path() -> None:
@@ -50,9 +52,35 @@ def test_main_fails_when_config_invalid(tmp_path: Path, mocker: MockerFixture) -
     run.assert_not_called()
 
 
-def test_main_runs_application_with_scheduler(tmp_path: Path, mocker: MockerFixture) -> None:
+DB_ENV = {"DB_HOST": "localhost", "DB_PORT": "5432", "DB_NAME": "upbit_bot", "DB_USER": "bot", "DB_PASSWORD": "pw"}
+DB_CONFIG = DatabaseConfig.from_env("DB_", DB_ENV)
+
+
+def test_main_fails_when_database_env_missing(
+    tmp_path: Path, mocker: MockerFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
     config = tmp_path / "config.json"
     config.write_text('{"timeframe": "30m", "markets": ["KRW-BTC"]}', encoding="utf-8")
+    for key in DB_ENV:
+        monkeypatch.delenv(key, raising=False)
+    connect = mocker.patch("src.main.Database.connect")
+
+    code = main(["--config", str(config)])
+
+    assert code == EXIT_STARTUP_FAILED
+    connect.assert_not_called()
+
+
+def test_main_runs_application_with_scheduler(
+    tmp_path: Path, mocker: MockerFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = tmp_path / "config.json"
+    config.write_text('{"timeframe": "30m", "markets": ["KRW-BTC"]}', encoding="utf-8")
+    for key, value in DB_ENV.items():
+        monkeypatch.setenv(key, value)
+    mocker.patch("src.main.Database.connect", new_callable=mocker.AsyncMock)
+    mocker.patch("src.main.Database.close", new_callable=mocker.AsyncMock)
+    mocker.patch("src.main.register_markets", new_callable=mocker.AsyncMock, return_value={"KRW-BTC": 1})
     run = mocker.patch("src.main.Application.run", new_callable=mocker.AsyncMock)
     add_service = mocker.spy(Application, "add_service")
 
@@ -63,14 +91,46 @@ def test_main_runs_application_with_scheduler(tmp_path: Path, mocker: MockerFixt
     assert add_service.call_args.args[1] == "scheduler:30m"
 
 
-async def test_run_closes_client_after_application_stops(mocker: MockerFixture) -> None:
+def _record(mocker: MockerFixture, target: str, events: list[str], name: str, **kwargs: object) -> None:
+    mocker.patch(target, side_effect=lambda *_: events.append(name), new_callable=mocker.AsyncMock, **kwargs)
+
+
+async def test_run_closes_connections_after_application_stops(mocker: MockerFixture) -> None:
     events: list[str] = []
-    mocker.patch("src.main.UpbitClient.open", side_effect=lambda: events.append("open"), new_callable=mocker.AsyncMock)
-    mocker.patch(
-        "src.main.UpbitClient.close", side_effect=lambda: events.append("close"), new_callable=mocker.AsyncMock
-    )
-    mocker.patch("src.main.Application.run", side_effect=lambda: events.append("run"), new_callable=mocker.AsyncMock)
+    _record(mocker, "src.main.Database.connect", events, "db open")
+    _record(mocker, "src.main.Database.close", events, "db close")
+    mocker.patch("src.main.register_markets", new_callable=mocker.AsyncMock, return_value={"KRW-BTC": 1})
+    _record(mocker, "src.main.UpbitClient.open", events, "upbit open")
+    _record(mocker, "src.main.UpbitClient.close", events, "upbit close")
+    _record(mocker, "src.main.Application.run", events, "run")
 
-    await run(Path("config.json"), TradingConfig(timeframe=Timeframe.MINUTE_30, markets=("KRW-BTC",)))
+    await run(Path("config.json"), TradingConfig(timeframe=Timeframe.MINUTE_30, markets=("KRW-BTC",)), DB_CONFIG)
 
-    assert events == ["open", "run", "close"]
+    assert events == ["db open", "upbit open", "run", "upbit close", "db close"]
+
+
+async def test_run_closes_database_when_market_registration_fails(mocker: MockerFixture) -> None:
+    events: list[str] = []
+    _record(mocker, "src.main.Database.connect", events, "db open")
+    _record(mocker, "src.main.Database.close", events, "db close")
+    mocker.patch("src.main.register_markets", new_callable=mocker.AsyncMock, side_effect=OSError("connection lost"))
+    _record(mocker, "src.main.Application.run", events, "run")
+
+    with pytest.raises(OSError, match="connection lost"):
+        await run(Path("config.json"), TradingConfig(timeframe=Timeframe.MINUTE_30, markets=("KRW-BTC",)), DB_CONFIG)
+
+    assert events == ["db open", "db close"]
+
+
+@pytest.mark.integration
+async def test_register_markets_is_idempotent(database: Database) -> None:
+    symbols = ["KRW-T" + uuid.uuid4().hex[:8].upper() for _ in range(2)]
+    try:
+        first = await register_markets(database, symbols)
+        again = await register_markets(database, symbols)
+
+        assert set(first) == set(symbols)
+        assert again == first
+    finally:
+        async with database.transaction() as conn:
+            await conn.execute("DELETE FROM market WHERE symbol = ANY($1::text[])", symbols)
