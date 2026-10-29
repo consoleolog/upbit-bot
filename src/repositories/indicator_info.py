@@ -10,6 +10,16 @@ class IndicatorInfoRepository:
         infos = [IndicatorInfo.from_record(row) for row in rows]
         return {info.indicator_type: info for info in infos}
 
+    async def clear_signal_states(self, conn: asyncpg.Connection, market_id: int) -> None:
+        """마켓의 모든 지표 타입의 신호 상태를 비운다. 지표 값은 그대로 둔다 (매매 로직 7)."""
+        await conn.execute(
+            """
+            UPDATE indicator_info SET over_state = NULL, over_time = NULL, cross_state = NULL, cross_time = NULL
+            WHERE market_id = $1
+            """,
+            market_id,
+        )
+
     async def save(self, conn: asyncpg.Connection, info: IndicatorInfo) -> IndicatorInfo | None:
         """최신 상태를 저장한다. 이미 같거나 더 새로운 캔들로 저장돼 있으면 바꾸지 않고 None.
 

@@ -3,11 +3,13 @@
 import math
 from dataclasses import dataclass
 from datetime import datetime
+from decimal import Decimal
 from enum import StrEnum
 from typing import Self
 
 import asyncpg
 
+from src.trading.reasons import Reason
 from src.trading.signals import CrossState, OverState
 
 
@@ -78,4 +80,47 @@ class IndicatorInfo:
             over_time=row["over_time"],
             cross_state=None if row["cross_state"] is None else CrossState(row["cross_state"]),
             cross_time=row["cross_time"],
+        )
+
+
+class PositionStatus(StrEnum):
+    OPEN = "OPEN"
+    CLOSED = "CLOSED"
+
+
+@dataclass(frozen=True, kw_only=True)
+class PaperPosition:
+    """모의 포지션. *_time은 판단한 캔들의 시작 시각이다."""
+
+    position_id: int
+    market_id: int
+    status: PositionStatus
+    entry_time: datetime
+    entry_price: Decimal
+    average_price: Decimal
+    # 매수할 때의 매도 기준(%) (매매 로직 2.3)
+    take_profit_rate: Decimal
+    stop_loss_rate: Decimal
+    min_profit_rate: Decimal
+    exit_time: datetime | None
+    exit_price: Decimal | None
+    exit_reason: Reason | None
+    net_profit_rate: Decimal | None
+
+    @classmethod
+    def from_record(cls, row: asyncpg.Record) -> Self:
+        return cls(
+            position_id=row["position_id"],
+            market_id=row["market_id"],
+            status=PositionStatus(row["status"]),
+            entry_time=row["entry_time"],
+            entry_price=row["entry_price"],
+            average_price=row["average_price"],
+            take_profit_rate=row["take_profit_rate"],
+            stop_loss_rate=row["stop_loss_rate"],
+            min_profit_rate=row["min_profit_rate"],
+            exit_time=row["exit_time"],
+            exit_price=row["exit_price"],
+            exit_reason=None if row["exit_reason"] is None else Reason(row["exit_reason"]),
+            net_profit_rate=row["net_profit_rate"],
         )

@@ -39,6 +39,8 @@ async def run(config_path: Path, config: TradingConfig, db_config: DatabaseConfi
                 timeframe=config.timeframe,
                 indicator_settings=config.indicator,
                 signal_settings=config.signal,
+                exit_settings=config.exit,
+                stochastic_entry_max=config.stochastic_entry_max,
                 market_ids=market_ids,
             )
             scheduler = CandleScheduler(

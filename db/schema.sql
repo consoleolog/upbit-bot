@@ -42,6 +42,41 @@ CREATE TABLE indicator_info (
     CHECK (over_state IS NULL OR indicator_type IN ('RSI', 'STOCHASTIC'))
 );
 
+-- 모의 포지션. 실제 주문 없이 매매 판단을 기록해 판단이 맞는지 검증한다.
+-- 체결은 판단한 캔들의 종가로 가정하고, 평단가는 매수 수수료를 포함한다 (매매 로직 5.2).
+CREATE TABLE paper_position (
+    position_id     bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    market_id       int         NOT NULL REFERENCES market (market_id),
+    status          varchar(10) NOT NULL DEFAULT 'OPEN',
+    entry_time      timestamptz NOT NULL,
+    entry_price     numeric     NOT NULL,
+    average_price   numeric     NOT NULL,
+    -- 매수할 때의 매도 기준(%). 보유 중에 설정을 바꿔도 이 포지션은 이 값을 끝까지 쓴다 (매매 로직 2.3)
+    take_profit_rate numeric    NOT NULL,
+    stop_loss_rate  numeric     NOT NULL,
+    min_profit_rate numeric     NOT NULL,
+    exit_time       timestamptz,
+    exit_price      numeric,
+    exit_reason     varchar(20),
+    net_profit_rate numeric,
+    created_at      timestamptz NOT NULL DEFAULT now(),
+    CHECK (status IN ('OPEN', 'CLOSED')),
+    CHECK (entry_price > 0 AND average_price >= entry_price),
+    CHECK (take_profit_rate > 0 AND stop_loss_rate > 0 AND min_profit_rate >= 0),
+    CHECK (exit_reason IN ('STOP_LOSS', 'TAKE_PROFIT', 'OVERBOUGHT_EXIT', 'DEAD_CROSS_EXIT')),
+    -- 열린 포지션은 매도 정보가 모두 없고, 닫힌 포지션은 모두 있다
+    CHECK (
+        (status = 'OPEN' AND exit_time IS NULL AND exit_price IS NULL AND exit_reason IS NULL AND net_profit_rate IS NULL)
+        OR (status = 'CLOSED' AND exit_time IS NOT NULL AND exit_price > 0 AND exit_reason IS NOT NULL
+            AND net_profit_rate IS NOT NULL)
+    ),
+    -- 매도는 매수한 캔들보다 뒤의 캔들에서만 한다
+    CHECK (exit_time > entry_time)
+);
+
+-- 마켓당 열린 포지션은 하나 (매매 로직 5.1). 같은 마켓을 두 번 사는 것을 DB에서 막는다
+CREATE UNIQUE INDEX paper_position_open_market ON paper_position (market_id) WHERE status = 'OPEN';
+
 CREATE FUNCTION set_updated_at() RETURNS trigger
 LANGUAGE plpgsql AS $$
 BEGIN
