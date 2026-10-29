@@ -4,24 +4,13 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
-from enum import StrEnum
 
 from src.app.config import ExitSettings
 from src.repositories.models import IndicatorInfo, IndicatorType
+from src.trading.reasons import Action, Reason
 from src.trading.signals import CrossState, OverState
 
-
-class Action(StrEnum):
-    BUY = "BUY"
-    SELL = "SELL"
-
-
-class Reason(StrEnum):
-    ENTRY = "ENTRY"
-    STOP_LOSS = "STOP_LOSS"
-    TAKE_PROFIT = "TAKE_PROFIT"
-    OVERBOUGHT_EXIT = "OVERBOUGHT_EXIT"
-    DEAD_CROSS_EXIT = "DEAD_CROSS_EXIT"
+__all__ = ["Action", "Decision", "Holding", "Reason", "decide", "net_profit_rate"]
 
 
 @dataclass(frozen=True, kw_only=True)

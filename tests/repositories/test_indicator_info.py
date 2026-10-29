@@ -101,3 +101,23 @@ async def test_save_rejects_signal_after_candle(conn: asyncpg.Connection) -> Non
 async def test_save_unknown_market_fails(conn: asyncpg.Connection) -> None:
     with pytest.raises(asyncpg.ForeignKeyViolationError):
         await repo.save(conn, _rsi(-1))
+
+
+async def test_clear_signal_states_of_one_market(conn: asyncpg.Connection) -> None:
+    target, other = await _market_id(conn), await _market_id(conn)
+    states = {
+        "over_state": OverState.OVER_SOLD,
+        "over_time": T0,
+        "cross_state": CrossState.GOLDEN_CROSS,
+        "cross_time": T0,
+    }
+    for market_id in (target, other):
+        await repo.save(conn, _rsi(market_id, **states))
+
+    await repo.clear_signal_states(conn, target)
+
+    cleared = (await repo.list_by_market(conn, target))[IndicatorType.RSI]
+    assert (cleared.over_state, cleared.over_time, cleared.cross_state, cleared.cross_time) == (None, None, None, None)
+    # 지표 값은 남기고, 다른 마켓은 그대로 둔다
+    assert (cleared.value, cleared.signal, cleared.candle_time) == (35.5, 40.25, T0)
+    assert (await repo.list_by_market(conn, other))[IndicatorType.RSI] == _rsi(other, **states)

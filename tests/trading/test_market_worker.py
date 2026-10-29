@@ -6,13 +6,15 @@ from decimal import Decimal
 from unittest.mock import MagicMock
 
 import pytest
+from pytest_mock import MockerFixture
 
-from src.app.config import Timeframe
+from src.app.config import ExitSettings, Timeframe
 from src.connections.database import Database
 from src.exchange.candle import Candle
 from src.repositories.indicator_info import IndicatorInfoRepository
 from src.repositories.market import MarketRepository
 from src.repositories.models import IndicatorInfo, IndicatorType
+from src.trading.decision import Action, Decision, Reason
 from src.trading.indicators import Indicators, IndicatorSettings, Line, calculate
 from src.trading.market_worker import (
     MAX_MISSED_CANDLES,
@@ -22,6 +24,7 @@ from src.trading.market_worker import (
     judge_candle,
     replay,
 )
+from src.trading.paper import PaperTrade
 from src.trading.signals import CrossState, OverState, SignalSettings
 
 MACD_TYPES = (IndicatorType.MACD_SHORT, IndicatorType.MACD_MID, IndicatorType.MACD_LONG)
@@ -346,6 +349,8 @@ def _worker(upbit: FakeUpbit, database: Database, market_ids: dict[str, int]) ->
         timeframe=Timeframe.MINUTE_30,
         indicator_settings=IndicatorSettings(),
         signal_settings=SignalSettings(),
+        exit_settings=ExitSettings(),
+        stochastic_entry_max=50.0,
         market_ids=market_ids,
     )
 
@@ -475,3 +480,53 @@ async def test_job_replays_missed_candles(database: Database, market: tuple[str,
     previous = {t: replace(info, market_id=market_id) for t, info in _done_at(done).items()}
     expected = _replay_by_hand(candles, 197, previous)
     assert await _saved(database, market_id) == {t: replace(info, market_id=market_id) for t, info in expected.items()}
+
+
+@pytest.mark.integration
+async def test_job_judges_paper_trade_once_on_latest_candle(
+    database: Database, market: tuple[str, int], mocker: MockerFixture
+) -> None:
+    symbol, market_id = market
+    candles = _candles(symbol, 200, CLOSE)
+    apply = mocker.patch("src.trading.market_worker.apply_paper_decision", new_callable=mocker.AsyncMock)
+    apply.return_value = None
+    worker = _worker(FakeUpbit(candles), database, {symbol: market_id})
+
+    await worker.candle_close_job(symbol, CLOSE)()
+    # 같은 마감을 다시 처리하면 저장한 것이 없으므로 판단하지 않는다 (같은 마켓을 두 번 사지 않음)
+    await worker.candle_close_job(symbol, CLOSE)()
+
+    apply.assert_awaited_once()
+    kwargs = apply.await_args.kwargs
+    assert (kwargs["market_id"], kwargs["candle"], kwargs["allow_buy"]) == (market_id, candles[-1], True)
+    assert kwargs["states"] == await _saved(database, market_id)
+
+
+@pytest.mark.integration
+async def test_job_does_not_allow_buy_with_too_few_candles(
+    database: Database, market: tuple[str, int], mocker: MockerFixture
+) -> None:
+    symbol, market_id = market
+    apply = mocker.patch("src.trading.market_worker.apply_paper_decision", new_callable=mocker.AsyncMock)
+    apply.return_value = None
+
+    candles = _candles(symbol, MIN_CANDLES_FOR_SIGNAL - 1, CLOSE)
+    await _worker(FakeUpbit(candles), database, {symbol: market_id}).candle_close_job(symbol, CLOSE)()
+
+    assert apply.await_args.kwargs["allow_buy"] is False
+
+
+@pytest.mark.integration
+async def test_job_logs_paper_trade(
+    database: Database, market: tuple[str, int], mocker: MockerFixture, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level("INFO")
+    symbol, market_id = market
+    candles = _candles(symbol, 200, CLOSE)
+    position = mocker.MagicMock(average_price=Decimal("100.05"), net_profit_rate=None)
+    trade = PaperTrade(decision=Decision(action=Action.BUY, reason=Reason.ENTRY), position=position)
+    mocker.patch("src.trading.market_worker.apply_paper_decision", new_callable=mocker.AsyncMock, return_value=trade)
+
+    await _worker(FakeUpbit(candles), database, {symbol: market_id}).candle_close_job(symbol, CLOSE)()
+
+    assert f"paper BUY (market={symbol}, reason=ENTRY" in caplog.text

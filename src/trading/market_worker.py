@@ -5,12 +5,13 @@ from datetime import datetime
 from typing import Protocol
 
 from src.app.application import Job
-from src.app.config import Timeframe
+from src.app.config import ExitSettings, Timeframe
 from src.connections.database import Database
 from src.exchange.candle import Candle
 from src.repositories.indicator_info import IndicatorInfoRepository
 from src.repositories.models import IndicatorInfo, IndicatorType
 from src.trading.indicators import Indicators, IndicatorSettings, Line, calculate
+from src.trading.paper import apply_paper_decision
 from src.trading.signals import CrossState, SignalSettings, Threshold, cross, over
 
 logger = logging.getLogger(__name__)
@@ -38,6 +39,8 @@ class MarketWorker:
         timeframe: Timeframe,
         indicator_settings: IndicatorSettings,
         signal_settings: SignalSettings,
+        exit_settings: ExitSettings,
+        stochastic_entry_max: float,
         market_ids: Mapping[str, int],
     ) -> None:
         self._upbit = upbit
@@ -45,6 +48,8 @@ class MarketWorker:
         self._timeframe = timeframe
         self._indicator_settings = indicator_settings
         self._signal_settings = signal_settings
+        self._exit_settings = exit_settings
+        self._stochastic_entry_max = stochastic_entry_max
         self._market_ids = market_ids
         self._indicator_infos = IndicatorInfoRepository()
 
@@ -83,6 +88,18 @@ class MarketWorker:
                 signal_settings=self._signal_settings,
             )
             saved = [info for info in result.infos if await self._indicator_infos.save(conn, info) is not None]
+            # 새로 처리한 최신 캔들에서만 한 번 판단한다 (매매 로직 3.0). 이미 처리한 마감이면 저장한 것이 없다
+            trade = None
+            if saved:
+                trade = await apply_paper_decision(
+                    conn,
+                    market_id=market_id,
+                    candle=candles[-1],
+                    states={info.indicator_type: info for info in result.infos},
+                    exit_settings=self._exit_settings,
+                    stochastic_entry_max=self._stochastic_entry_max,
+                    allow_buy=len(candles) >= MIN_CANDLES_FOR_SIGNAL,
+                )
         # 커밋된 뒤에 기록한다
         if result.reset:
             logger.warning("missed more than %d candles; signal states reset (market=%s)", MAX_MISSED_CANDLES, market)
@@ -96,6 +113,18 @@ class MarketWorker:
             len(saved),
             " ".join(_describe(info) for info in saved),
         )
+        if trade is not None:
+            position = trade.position
+            logger.info(
+                "paper %s (market=%s, reason=%s, candle=%s, price=%s, average_price=%s, net_profit_rate=%s)",
+                trade.decision.action,
+                market,
+                trade.decision.reason,
+                candles[-1].start_kst.isoformat(),
+                candles[-1].close,
+                position.average_price,
+                position.net_profit_rate,
+            )
 
 
 @dataclass(frozen=True, kw_only=True)
