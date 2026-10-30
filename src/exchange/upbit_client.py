@@ -7,8 +7,10 @@ from typing import Any, Literal, Self
 import httpx
 
 from src.app.config import Timeframe
+from src.exchange.account import Account, OrderChance
 from src.exchange.candle import Candle
 from src.exchange.rate_limiter import RateLimiter
+from src.exchange.upbit_auth import UpbitCredentials, authorization, encode_query
 
 BASE_URL = "https://api.upbit.com"
 
@@ -24,6 +26,8 @@ MAX_CANDLES = 200
 # 캔들 조회의 초당 요청 수. 업비트 Remaining-Req 헤더 기준 한도는 초당 10회(candles 그룹, IP별)이고,
 # 우리와 업비트가 1초를 재는 시점이 어긋날 수 있어 여유를 둔다. 여유분은 근거 있는 값이 아니다
 CANDLE_REQUESTS_PER_SECOND = 8
+# 거래·자산(exchange) API의 초당 요청 수. 업비트 한도는 포켓 단위로 default 그룹 초당 30회이고, 여유를 둔다
+EXCHANGE_REQUESTS_PER_SECOND = 25
 # 업비트 캔들 경계는 UTC 기준으로 timeframe마다 나뉜다 (실제 응답으로 확인)
 EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 
@@ -95,7 +99,7 @@ _ERRORS_BY_STATUS: dict[int, type[UpbitError]] = {
 
 
 class UpbitClient:
-    """업비트 REST API 클라이언트. 지금은 요청과 오류 처리만 있다."""
+    """업비트 REST API 클라이언트. 계좌 조회 등 인증이 필요한 요청은 credentials가 있어야 한다."""
 
     def __init__(
         self,
@@ -105,6 +109,8 @@ class UpbitClient:
         transport: httpx.AsyncBaseTransport | None = None,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
         candle_limiter: RateLimiter | None = None,
+        credentials: UpbitCredentials | None = None,
+        exchange_limiter: RateLimiter | None = None,
     ) -> None:
         if timeout <= 0:
             raise ValueError("timeout must be positive")
@@ -113,6 +119,8 @@ class UpbitClient:
         self._transport = transport
         self._clock = clock
         self._candle_limiter = candle_limiter or RateLimiter(CANDLE_REQUESTS_PER_SECOND)
+        self._credentials = credentials
+        self._exchange_limiter = exchange_limiter or RateLimiter(EXCHANGE_REQUESTS_PER_SECOND)
         self._http: httpx.AsyncClient | None = None
 
     async def open(self) -> None:
@@ -160,17 +168,55 @@ class UpbitClient:
                 raise UpbitResponseError(f"candle does not match request ({market}, to={to.isoformat()}): {candle}")
         return candles
 
-    async def _request(self, method: Method, path: str, params: dict[str, Any] | None = None) -> Any:
-        """요청을 보내고 JSON 응답을 돌려준다. 실패하면 UpbitError. 재시도하지 않는다."""
+    async def get_accounts(self) -> list[Account]:
+        """보유한 화폐별 잔고. 인증이 필요하다."""
+        await self._exchange_limiter.acquire()
+        raw = await self._request("GET", "/v1/accounts", auth=True)
+        if not isinstance(raw, list):
+            raise UpbitResponseError(f"unexpected accounts response: {type(raw).__name__}")
+        accounts = [_parse_account(item) for item in raw]
+        currencies = [account.currency for account in accounts]
+        if len(set(currencies)) != len(currencies):
+            raise UpbitResponseError(f"accounts response has duplicate currencies: {currencies}")
+        return accounts
+
+    async def get_order_chance(self, market: str) -> OrderChance:
+        """마켓의 수수료와 최소·최대 주문 금액 (매매 로직 5.2, 6.1). 인증이 필요하다."""
+        await self._exchange_limiter.acquire()
+        raw = await self._request("GET", "/v1/orders/chance", {"market": market}, auth=True)
+        chance = _parse_order_chance(raw)
+        if chance.market != market:
+            raise UpbitResponseError(f"order chance does not match request ({market}): {chance.market}")
+        return chance
+
+    async def _request(
+        self, method: Method, path: str, params: dict[str, Any] | None = None, *, auth: bool = False
+    ) -> Any:
+        """요청을 보내고 JSON 응답을 돌려준다. 실패하면 UpbitError. 재시도하지 않는다.
+
+        auth면 JWT 인증 헤더를 붙인다. 오류 메시지에는 쿼리 문자열과 헤더를 넣지 않는다.
+        """
         if self._http is None:
             raise RuntimeError("client is not open")
+        headers: dict[str, str] = {}
+        url = path
+        if auth:
+            if self._credentials is None:
+                raise RuntimeError("upbit credentials are required for this request")
+            if method != "GET":
+                raise NotImplementedError("authenticated POST is not supported yet")
+            # query_hash는 실제로 보내는 쿼리 문자열로 만들어야 하므로, 직접 붙여서 보낸다
+            query = encode_query(params) if params else ""
+            url = f"{path}?{query}" if query else path
+            headers["Authorization"] = authorization(self._credentials, query)
+            params = None
         try:
             # httpx의 timeout은 연결·쓰기·읽기 단계마다 따로 걸리므로, 요청 전체에도 한 번 더 건다
             async with asyncio.timeout(self._timeout):
                 if method == "GET":
-                    response = await self._http.get(path, params=params)
+                    response = await self._http.get(url, params=params, headers=headers)
                 else:
-                    response = await self._http.post(path, json=params)
+                    response = await self._http.post(url, json=params, headers=headers)
         except _NOT_SENT_ERRORS as error:
             raise UpbitConnectionError(f"{method} {path} failed to connect: {type(error).__name__}") from error
         except (TimeoutError, httpx.TimeoutException) as error:
@@ -238,3 +284,59 @@ def parse_price(value: object) -> Decimal:
     if not price.is_finite() or price <= 0:
         raise ValueError(f"price must be positive: {value!r}")
     return price
+
+
+def _parse_account(raw: object) -> Account:
+    """업비트 계좌 응답 한 건을 Account로 바꾼다. 형식이나 값이 잘못되면 UpbitResponseError."""
+    try:
+        if not isinstance(raw, dict) or not isinstance(raw["currency"], str) or not raw["currency"]:
+            raise TypeError("account must be an object with a currency")
+        if not isinstance(raw["unit_currency"], str):
+            raise TypeError("unit_currency must be a string")
+        return Account(
+            currency=raw["currency"],
+            balance=_amount(raw["balance"]),
+            locked=_amount(raw["locked"]),
+            avg_buy_price=_amount(raw["avg_buy_price"]),
+            unit_currency=raw["unit_currency"],
+        )
+    except (KeyError, TypeError, ValueError, ArithmeticError) as error:
+        raise UpbitResponseError(f"invalid upbit account: {raw!r}") from error
+
+
+def _parse_order_chance(raw: object) -> OrderChance:
+    """업비트 주문 가능 정보 응답을 OrderChance로 바꾼다. 형식이나 값이 잘못되면 UpbitResponseError."""
+    try:
+        if not isinstance(raw, dict) or not isinstance(raw["market"], dict):
+            raise TypeError("order chance must be an object with a market")
+        market = raw["market"]
+        if not isinstance(market["id"], str) or not isinstance(market["state"], str):
+            raise TypeError("market id and state must be strings")
+        bid_fee, ask_fee = _amount(raw["bid_fee"]), _amount(raw["ask_fee"])
+        if bid_fee >= 1 or ask_fee >= 1:
+            raise ValueError("fee rate must be less than 1")
+        chance = OrderChance(
+            market=market["id"],
+            bid_fee=bid_fee,
+            ask_fee=ask_fee,
+            bid_min_total=_amount(market["bid"]["min_total"]),
+            ask_min_total=_amount(market["ask"]["min_total"]),
+            max_total=_amount(market["max_total"]),
+            state=market["state"],
+        )
+        if chance.bid_min_total <= 0 or chance.ask_min_total <= 0 or chance.max_total <= 0:
+            raise ValueError("order totals must be positive")
+        return chance
+    except (KeyError, TypeError, ValueError, ArithmeticError) as error:
+        raise UpbitResponseError(f"invalid upbit order chance: {raw!r}") from error
+
+
+def _amount(value: object) -> Decimal:
+    """업비트 거래·자산 응답의 숫자 문자열(금액·수량·비율)을 Decimal로 바꾼다. 음수·무한대·NaN이면 예외."""
+    # 업비트는 이 값들을 정밀도를 지키려고 문자열로 준다 (예: "1000000.0"). 숫자가 오면 형식이 바뀐 것이다
+    if not isinstance(value, str):
+        raise TypeError(f"amount must be a numeric string: {value!r}")
+    amount = Decimal(value)
+    if not amount.is_finite() or amount < 0:
+        raise ValueError(f"amount must be a finite non-negative number: {value!r}")
+    return amount
