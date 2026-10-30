@@ -10,8 +10,16 @@ import jwt
 import pytest
 
 from src.exchange.account import Account, OrderChance
+from src.exchange.rate_limiter import RateLimiter
 from src.exchange.upbit_auth import UpbitCredentials
-from src.exchange.upbit_client import UpbitAuthError, UpbitClient, UpbitResponseError
+from src.exchange.upbit_client import (
+    DEFAULT_GROUP_REQUESTS_PER_SECOND,
+    ORDER_GROUP_REQUESTS_PER_SECOND,
+    ORDER_TEST_GROUP_REQUESTS_PER_SECOND,
+    UpbitAuthError,
+    UpbitClient,
+    UpbitResponseError,
+)
 
 SECRET = "secret-key-1-" + "x" * 64  # HS512 권장 길이(64바이트) 이상
 CREDENTIALS = UpbitCredentials(access_key="access-key-1", secret_key=SECRET)
@@ -269,3 +277,53 @@ async def test_query_hash_matches_sent_query_with_array_and_special_values() -> 
     sent = upbit.requests[0].url.query.decode()
     assert sent == "market=KRW-BTC&states%5B%5D=wait&states%5B%5D=watch&limit=10&note=a+b%2Bc"
     assert _payload(upbit.requests[0])["query_hash"] == hashlib.sha512(unquote(sent).encode()).hexdigest()
+
+
+class CountingLimiter(RateLimiter):
+    def __init__(self) -> None:
+        super().__init__(1000)
+        self.count = 0
+
+    async def acquire(self) -> None:
+        self.count += 1
+        await super().acquire()
+
+
+async def test_account_queries_use_default_group_limiter() -> None:
+    limiters = {name: CountingLimiter() for name in ("candle", "default", "order", "order_test")}
+    handler = Upbit(body=ACCOUNTS)
+    client = UpbitClient(
+        transport=httpx.MockTransport(
+            lambda request: handler(request) if request.url.path == "/v1/accounts" else httpx.Response(200, json=CHANCE)
+        ),
+        credentials=CREDENTIALS,
+        candle_limiter=limiters["candle"],
+        default_limiter=limiters["default"],
+        order_limiter=limiters["order"],
+        order_test_limiter=limiters["order_test"],
+    )
+    async with client:
+        await client.get_accounts()
+        await client.get_order_chance("KRW-BTC")
+
+    # 업비트는 그룹마다 따로 센다. 계좌·주문 가능 정보는 default 그룹이다
+    assert {name: limiter.count for name, limiter in limiters.items()} == {
+        "candle": 0,
+        "default": 2,
+        "order": 0,
+        "order_test": 0,
+    }
+
+
+def test_group_limits_stay_below_upbit_limits() -> None:
+    # 업비트 문서 "요청 수 제한": default 초당 30회, order 초당 12회, order-test 초당 8회 (포켓 단위)
+    assert DEFAULT_GROUP_REQUESTS_PER_SECOND < 30
+    assert ORDER_GROUP_REQUESTS_PER_SECOND < 12
+    assert ORDER_TEST_GROUP_REQUESTS_PER_SECOND < 8
+
+
+def test_each_group_has_its_own_limiter() -> None:
+    client = UpbitClient(credentials=CREDENTIALS)
+
+    limiters = [client._candle_limiter, client._default_limiter, client._order_limiter, client._order_test_limiter]
+    assert len({id(limiter) for limiter in limiters}) == 4
