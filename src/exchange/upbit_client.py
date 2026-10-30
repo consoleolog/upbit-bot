@@ -26,8 +26,14 @@ MAX_CANDLES = 200
 # 캔들 조회의 초당 요청 수. 업비트 Remaining-Req 헤더 기준 한도는 초당 10회(candles 그룹, IP별)이고,
 # 우리와 업비트가 1초를 재는 시점이 어긋날 수 있어 여유를 둔다. 여유분은 근거 있는 값이 아니다
 CANDLE_REQUESTS_PER_SECOND = 8
-# 거래·자산(exchange) API의 초당 요청 수. 업비트 한도는 포켓 단위로 default 그룹 초당 30회이고, 여유를 둔다
-EXCHANGE_REQUESTS_PER_SECOND = 25
+# 거래·자산(exchange) API의 초당 요청 수. 업비트 한도는 포켓 단위로 그룹마다 따로 센다 (업비트 문서 "요청 수 제한").
+# 우리와 업비트가 1초를 재는 시점이 어긋날 수 있어 여유를 둔다. 여유분은 근거 있는 값이 아니다
+# default 그룹(계좌·주문 가능 정보·주문 조회): 초당 30회
+DEFAULT_GROUP_REQUESTS_PER_SECOND = 25
+# order 그룹(주문 생성): 초당 12회
+ORDER_GROUP_REQUESTS_PER_SECOND = 10
+# order-test 그룹(주문 생성 테스트): 초당 8회
+ORDER_TEST_GROUP_REQUESTS_PER_SECOND = 6
 # 업비트 캔들 경계는 UTC 기준으로 timeframe마다 나뉜다 (실제 응답으로 확인)
 EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 
@@ -128,7 +134,9 @@ class UpbitClient:
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
         candle_limiter: RateLimiter | None = None,
         credentials: UpbitCredentials | None = None,
-        exchange_limiter: RateLimiter | None = None,
+        default_limiter: RateLimiter | None = None,
+        order_limiter: RateLimiter | None = None,
+        order_test_limiter: RateLimiter | None = None,
     ) -> None:
         if timeout <= 0:
             raise ValueError("timeout must be positive")
@@ -138,7 +146,9 @@ class UpbitClient:
         self._clock = clock
         self._candle_limiter = candle_limiter or RateLimiter(CANDLE_REQUESTS_PER_SECOND)
         self._credentials = credentials
-        self._exchange_limiter = exchange_limiter or RateLimiter(EXCHANGE_REQUESTS_PER_SECOND)
+        self._default_limiter = default_limiter or RateLimiter(DEFAULT_GROUP_REQUESTS_PER_SECOND)
+        self._order_limiter = order_limiter or RateLimiter(ORDER_GROUP_REQUESTS_PER_SECOND)
+        self._order_test_limiter = order_test_limiter or RateLimiter(ORDER_TEST_GROUP_REQUESTS_PER_SECOND)
         self._http: httpx.AsyncClient | None = None
 
     async def open(self) -> None:
@@ -188,7 +198,7 @@ class UpbitClient:
 
     async def get_accounts(self) -> list[Account]:
         """보유한 화폐별 잔고. 인증이 필요하다."""
-        await self._exchange_limiter.acquire()
+        await self._default_limiter.acquire()
         raw = await self._request("GET", "/v1/accounts", auth=True)
         if not isinstance(raw, list):
             raise UpbitResponseError(f"unexpected accounts response: {type(raw).__name__}")
@@ -200,7 +210,7 @@ class UpbitClient:
 
     async def get_order_chance(self, market: str) -> OrderChance:
         """마켓의 수수료와 최소·최대 주문 금액 (매매 로직 5.2, 6.1). 인증이 필요하다."""
-        await self._exchange_limiter.acquire()
+        await self._default_limiter.acquire()
         raw = await self._request("GET", "/v1/orders/chance", {"market": market}, auth=True)
         chance = _parse_order_chance(raw)
         if chance.market != market:
