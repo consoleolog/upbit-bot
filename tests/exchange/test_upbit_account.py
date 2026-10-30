@@ -1,9 +1,10 @@
 """업비트 계좌·주문 가능 정보 조회. 정상 응답은 업비트 개발자 문서의 응답 예시를 그대로 쓴다."""
 
 import hashlib
+import json
 from decimal import Decimal
 from typing import Any
-from urllib.parse import unquote
+from urllib.parse import unquote, urlencode
 
 import httpx
 import jwt
@@ -19,6 +20,7 @@ from src.exchange.upbit_client import (
     UpbitAuthError,
     UpbitClient,
     UpbitResponseError,
+    format_amount,
 )
 
 SECRET = "secret-key-1-" + "x" * 64  # HS512 권장 길이(64바이트) 이상
@@ -257,14 +259,75 @@ async def test_invalid_order_chance_rejected(body: object) -> None:
         await _call(Upbit(body=body), "get_order_chance", "KRW-BTC")
 
 
-async def test_authenticated_post_is_not_supported_yet() -> None:
-    upbit = Upbit(body={})
+ORDER_BODY = {"market": "KRW-BTC", "side": "bid", "ord_type": "price", "price": "5000", "identifier": "order-1"}
+
+
+async def _post(body: dict[str, object]) -> Upbit:
+    upbit = Upbit(201, {"uuid": "abc"})
     async with UpbitClient(transport=httpx.MockTransport(upbit), credentials=CREDENTIALS) as client:
-        # 주문(POST)은 다음 단계에서 만든다. 그 전에는 인증 POST를 보내지 않는다
-        with pytest.raises(NotImplementedError):
-            await client._request("POST", "/v1/orders", {"market": "KRW-BTC"}, auth=True)
+        await client._request("POST", "/v1/orders", body, auth=True)
+    return upbit
+
+
+async def test_authenticated_post_sends_json_body() -> None:
+    upbit = await _post(ORDER_BODY)
+
+    request = upbit.requests[0]
+    assert (request.method, request.url.path, request.url.query) == ("POST", "/v1/orders", b"")
+    assert request.headers["Content-Type"] == "application/json"
+    assert json.loads(request.read()) == ORDER_BODY
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        ORDER_BODY,
+        # 키 순서가 달라도 보낸 본문의 순서와 해시의 순서가 같아야 한다
+        dict(reversed(list(ORDER_BODY.items()))),
+        {"market": "KRW-BTC", "side": "ask", "ord_type": "market", "volume": "0.00000001", "identifier": "id 2+x"},
+    ],
+)
+async def test_post_query_hash_matches_body_actually_sent(body: dict[str, str]) -> None:
+    upbit = await _post(body)
+
+    request = upbit.requests[0]
+    sent = json.loads(request.read())
+    assert list(sent) == list(body)
+    # 업비트 인증 문서: 본문의 키·값을 같은 순서의 쿼리 문자열로 만들어 SHA512로 해시한다
+    expected = hashlib.sha512(unquote(urlencode(sent)).encode()).hexdigest()
+    assert _payload(request)["query_hash"] == expected
+    assert _payload(request)["query_hash_alg"] == "SHA512"
+
+
+@pytest.mark.parametrize("value", [5000, Decimal("5000"), 0.001, None])
+async def test_post_body_values_must_be_strings(value: object) -> None:
+    upbit = Upbit(201, {"uuid": "abc"})
+    async with UpbitClient(transport=httpx.MockTransport(upbit), credentials=CREDENTIALS) as client:
+        # 숫자를 그대로 보내면 JSON과 해시의 표기가 달라질 수 있다
+        with pytest.raises(TypeError, match="must be strings"):
+            await client._request("POST", "/v1/orders", {**ORDER_BODY, "price": value}, auth=True)
 
     assert upbit.requests == []
+
+
+@pytest.mark.parametrize(
+    ("value", "text"),
+    [
+        (Decimal("5000"), "5000"),
+        (Decimal("1E-8"), "0.00000001"),
+        (Decimal("1.5E+3"), "1500"),
+        (Decimal("0.12345678"), "0.12345678"),
+        (Decimal("100000000.0"), "100000000.0"),
+    ],
+)
+def test_format_amount_without_exponent(value: Decimal, text: str) -> None:
+    assert format_amount(value) == text
+
+
+@pytest.mark.parametrize("value", [Decimal("0"), Decimal("-1"), Decimal("NaN"), Decimal("Infinity")])
+def test_format_amount_rejects_unusable_amount(value: Decimal) -> None:
+    with pytest.raises(ValueError, match="positive finite"):
+        format_amount(value)
 
 
 async def test_query_hash_matches_sent_query_with_array_and_special_values() -> None:
