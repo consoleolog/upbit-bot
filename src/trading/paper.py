@@ -2,12 +2,14 @@
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import datetime
 from decimal import Decimal
 
 import asyncpg
 
 from src.app.config import ExitSettings
 from src.exchange.candle import Candle
+from src.exchange.ticker import Ticker
 from src.repositories.indicator_info import IndicatorInfoRepository
 from src.repositories.models import IndicatorInfo, IndicatorType, PaperPosition
 from src.repositories.paper_position import PaperPositionRepository
@@ -42,22 +44,12 @@ async def apply_paper_decision(
     """
     positions = PaperPositionRepository()
     current = await positions.get_open(conn, market_id)
-    holding = None if current is None else Holding(average_price=current.average_price)
-    held_exit_settings = (
-        exit_settings
-        if current is None
-        else ExitSettings(
-            take_profit_rate=current.take_profit_rate,
-            stop_loss_rate=current.stop_loss_rate,
-            min_profit_rate=current.min_profit_rate,
-        )
-    )
     decision = decide(
         states=states,
-        holding=holding,
+        holding=None if current is None else Holding(average_price=current.average_price),
         candle_time=candle.start,
         close=candle.close,
-        exit_settings=held_exit_settings,
+        exit_settings=exit_settings if current is None else _held_exit_settings(current),
         stochastic_entry_max=stochastic_entry_max,
         sell_fee_rate=PAPER_FEE_RATE,
     )
@@ -77,20 +69,59 @@ async def apply_paper_decision(
         # 열린 포지션이 이미 있으면 DB 제약이 막는다. 같은 마켓을 두 번 사지 않는다
         if opened is None:
             return None
-        position = opened
-    else:
-        if current is None:
-            # decide는 보유 중일 때만 매도를 돌려준다. 여기에 오면 판단 로직의 버그다
-            raise RuntimeError(f"sell decided without an open paper position (market_id={market_id})")
-        position = await positions.close(
-            conn,
-            position_id=current.position_id,
-            exit_time=candle.start,
-            exit_price=candle.close,
-            exit_reason=decision.reason,
-            net_profit_rate=net_profit_rate(
-                price=candle.close, average_price=current.average_price, sell_fee_rate=PAPER_FEE_RATE
-            ),
-        )
-    await IndicatorInfoRepository().clear_signal_states(conn, market_id)
+        await IndicatorInfoRepository().clear_signal_states(conn, market_id)
+        return PaperTrade(decision=decision, position=opened)
+    if current is None:
+        # decide는 보유 중일 때만 매도를 돌려준다. 여기에 오면 판단 로직의 버그다
+        raise RuntimeError(f"sell decided without an open paper position (market_id={market_id})")
+    return await _sell(conn, current, decision, time=candle.start, price=candle.close)
+
+
+async def apply_realtime_exit(conn: asyncpg.Connection, *, market_id: int, ticker: Ticker) -> PaperTrade | None:
+    """캔들 마감 사이에 현재가로 보유 중인 모의 포지션의 손절·익절만 판단한다 (매매 로직 5.1). 팔지 않으면 None.
+
+    신호 상태 없이 판단하므로 decide는 손절 → 익절만 본다. 기준은 매수할 때 저장한 값이다 (매매 로직 2.3).
+    매도를 기록하면 이 마켓의 신호 상태를 모두 비운다 (매매 로직 7). 호출하는 쪽의 트랜잭션 안에서 실행한다.
+    """
+    current = await PaperPositionRepository().get_open(conn, market_id)
+    # 매수한 캔들보다 앞선 체결가로는 판단하지 않는다 (매도 시각은 매수 캔들보다 뒤여야 한다)
+    if current is None or ticker.traded_at <= current.entry_time:
+        return None
+    decision = decide(
+        states={},
+        holding=Holding(average_price=current.average_price),
+        candle_time=ticker.traded_at,
+        close=ticker.price,
+        exit_settings=_held_exit_settings(current),
+        # 보유 중이라 매수 판단은 하지 않으므로 쓰이지 않는다
+        stochastic_entry_max=0.0,
+        sell_fee_rate=PAPER_FEE_RATE,
+    )
+    if decision is None:
+        return None
+    return await _sell(conn, current, decision, time=ticker.traded_at, price=ticker.price)
+
+
+def _held_exit_settings(position: PaperPosition) -> ExitSettings:
+    """매수할 때 저장한 매도 기준 (매매 로직 2.3)."""
+    return ExitSettings(
+        take_profit_rate=position.take_profit_rate,
+        stop_loss_rate=position.stop_loss_rate,
+        min_profit_rate=position.min_profit_rate,
+    )
+
+
+async def _sell(
+    conn: asyncpg.Connection, current: PaperPosition, decision: Decision, *, time: datetime, price: Decimal
+) -> PaperTrade:
+    """모의 매도를 기록하고 마켓의 신호 상태를 비운다 (매매 로직 7)."""
+    position = await PaperPositionRepository().close(
+        conn,
+        position_id=current.position_id,
+        exit_time=time,
+        exit_price=price,
+        exit_reason=decision.reason,
+        net_profit_rate=net_profit_rate(price=price, average_price=current.average_price, sell_fee_rate=PAPER_FEE_RATE),
+    )
+    await IndicatorInfoRepository().clear_signal_states(conn, current.market_id)
     return PaperTrade(decision=decision, position=position)

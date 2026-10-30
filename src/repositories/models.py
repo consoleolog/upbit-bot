@@ -90,7 +90,8 @@ class PositionStatus(StrEnum):
 
 @dataclass(frozen=True, kw_only=True)
 class PaperPosition:
-    """모의 포지션. *_time은 판단한 캔들의 시작 시각이다."""
+    """모의 포지션. entry_time은 매수를 판단한 캔들의 시작 시각, exit_time은 매도를 판단한 캔들의 시작 시각이나
+    실시간 손절·익절이면 판단에 쓴 체결 시각이다."""
 
     position_id: int
     market_id: int
