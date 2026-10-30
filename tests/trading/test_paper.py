@@ -8,12 +8,13 @@ import pytest
 
 from src.app.config import ExitSettings
 from src.exchange.candle import Candle
+from src.exchange.ticker import Ticker
 from src.repositories.indicator_info import IndicatorInfoRepository
 from src.repositories.market import MarketRepository
 from src.repositories.models import IndicatorInfo, IndicatorType, PositionStatus
 from src.repositories.paper_position import PaperPositionRepository
 from src.trading.decision import Action, Reason
-from src.trading.paper import PAPER_FEE_RATE, PaperTrade, apply_paper_decision
+from src.trading.paper import PAPER_FEE_RATE, PaperTrade, apply_paper_decision, apply_realtime_exit
 from src.trading.signals import CrossState, OverState
 
 pytestmark = pytest.mark.integration
@@ -240,3 +241,90 @@ async def test_holding_uses_exit_settings_from_entry(
     else:
         assert trade is None
         assert await positions.get_open(conn, market_id) is not None
+
+
+# ---------------------------------------------------------------------------
+# 실시간 손절·익절 (매매 로직 5.1)
+# ---------------------------------------------------------------------------
+
+
+def _tick(price: str, traded_at: datetime = T1 + timedelta(seconds=5)) -> Ticker:
+    return Ticker(market="KRW-BTC", price=Decimal(price), traded_at=traded_at)
+
+
+async def _hold(conn: asyncpg.Connection, market_id: int, exit_settings: ExitSettings | None = None) -> None:
+    await positions.open(
+        conn,
+        market_id=market_id,
+        entry_time=T0,
+        entry_price=Decimal("100"),
+        average_price=Decimal("100"),
+        exit_settings=exit_settings or ExitSettings(),
+    )
+
+
+async def test_realtime_without_position_does_nothing(conn: asyncpg.Connection) -> None:
+    assert await apply_realtime_exit(conn, market_id=await _market_id(conn), ticker=_tick("50")) is None
+
+
+@pytest.mark.parametrize("price", ["97.1", "100", "101.5"])
+async def test_realtime_within_range_keeps_position(conn: asyncpg.Connection, price: str) -> None:
+    market_id = await _market_id(conn)
+    await _hold(conn, market_id)
+
+    # 수수료를 빼면 97.1 → -2.95%, 101.5 → 1.449%로 손절·익절 기준에 닿지 않는다
+    assert await apply_realtime_exit(conn, market_id=market_id, ticker=_tick(price)) is None
+    assert await positions.get_open(conn, market_id) is not None
+
+
+@pytest.mark.parametrize(("price", "reason"), [("97", Reason.STOP_LOSS), ("101.6", Reason.TAKE_PROFIT)])
+async def test_realtime_stop_loss_and_take_profit(conn: asyncpg.Connection, price: str, reason: Reason) -> None:
+    market_id = await _market_id(conn)
+    await _hold(conn, market_id)
+    states = await _save_states(conn, market_id, T0, overbought=True)
+    traded_at = T1 + timedelta(minutes=7, seconds=3)
+
+    trade = await apply_realtime_exit(conn, market_id=market_id, ticker=_tick(price, traded_at))
+
+    assert trade is not None
+    assert (trade.decision.action, trade.decision.reason) == (Action.SELL, reason)
+    # 판단에 쓴 체결가와 체결 시각으로 기록한다
+    position = trade.position
+    assert (position.status, position.exit_time, position.exit_price) == (
+        PositionStatus.CLOSED,
+        traded_at,
+        Decimal(price),
+    )
+    expected = (Decimal(price) * (1 - PAPER_FEE_RATE) - Decimal("100")) / Decimal("100") * 100
+    assert position.net_profit_rate == expected
+    # 매도하면 신호 상태를 비운다 (매매 로직 7)
+    assert _all_cleared(await infos.list_by_market(conn, market_id))
+    assert len(states) == 5
+
+
+async def test_realtime_never_sells_on_signals(conn: asyncpg.Connection) -> None:
+    market_id = await _market_id(conn)
+    await _hold(conn, market_id)
+    # 과매수 매도 조건이 저장돼 있고 순수익률도 최소 기준(0.5%)을 넘지만, 실시간에는 손절·익절만 본다
+    await _save_states(conn, market_id, T1, overbought=True)
+
+    assert await apply_realtime_exit(conn, market_id=market_id, ticker=_tick("101")) is None
+
+
+async def test_realtime_uses_exit_settings_from_entry(conn: asyncpg.Connection) -> None:
+    market_id = await _market_id(conn)
+    await _hold(conn, market_id, ExitSettings(stop_loss_rate=Decimal("1")))
+
+    # 저장된 손절 기준 1%로 판단한다 (매매 로직 2.3)
+    trade = await apply_realtime_exit(conn, market_id=market_id, ticker=_tick("98.5"))
+
+    assert trade is not None and trade.decision.reason == Reason.STOP_LOSS
+
+
+@pytest.mark.parametrize("traded_at", [T0, T0 - timedelta(seconds=1)])
+async def test_realtime_ignores_ticker_before_entry(conn: asyncpg.Connection, traded_at: datetime) -> None:
+    market_id = await _market_id(conn)
+    await _hold(conn, market_id)
+
+    assert await apply_realtime_exit(conn, market_id=market_id, ticker=_tick("50", traded_at)) is None
+    assert await positions.get_open(conn, market_id) is not None
