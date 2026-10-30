@@ -220,7 +220,7 @@ def _parse_candle(raw: object) -> Candle:
             raise TypeError("candle must be an object with a market code")
         start = datetime.strptime(raw["candle_date_time_utc"], CANDLE_TIME_FORMAT).replace(tzinfo=UTC)
         open_, high, low, close = (
-            _price(raw[key]) for key in ("opening_price", "high_price", "low_price", "trade_price")
+            parse_price(raw[key]) for key in ("opening_price", "high_price", "low_price", "trade_price")
         )
         if not low <= min(open_, close) <= max(open_, close) <= high:
             raise ValueError("prices must satisfy low <= open, close <= high")
@@ -229,11 +229,12 @@ def _parse_candle(raw: object) -> Candle:
     return Candle(market=raw["market"], start=start, open=open_, high=high, low=low, close=close)
 
 
-def _price(value: object) -> Decimal:
+def parse_price(value: object) -> Decimal:
+    """업비트 응답의 가격을 Decimal로 바꾼다. 숫자가 아니거나 0 이하·무한대·NaN이면 예외."""
     # bool은 int의 하위 타입이라 따로 막는다. float는 문자열을 거쳐 표기된 값 그대로 바꾼다
-    if isinstance(value, bool) or not isinstance(value, int | float):
+    if isinstance(value, bool) or not isinstance(value, int | float | Decimal):
         raise TypeError(f"price must be a number: {value!r}")
-    price = Decimal(str(value))
+    price = value if isinstance(value, Decimal) else Decimal(str(value))
     if not price.is_finite() or price <= 0:
         raise ValueError(f"price must be positive: {value!r}")
     return price
