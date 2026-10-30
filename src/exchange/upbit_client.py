@@ -68,6 +68,14 @@ class UpbitAuthError(UpbitError):
     """401: 인증 오류."""
 
 
+class UpbitForbiddenError(UpbitError):
+    """403 또는 out_of_scope: API 키 권한이나 보안 설정 때문에 허용되지 않음."""
+
+
+class UpbitNotFoundError(UpbitError):
+    """404: 요청한 주문 등을 찾을 수 없음 (예: order_not_found)."""
+
+
 class UpbitBlockedError(UpbitError):
     """418: 요청 수 제한을 계속 어겨 IP가 차단됨."""
 
@@ -78,6 +86,14 @@ class UpbitRateLimitError(UpbitError):
 
 class UpbitServerError(UpbitError):
     """5xx: 거래소 장애."""
+
+
+class UpbitServerResultUnknownError(UpbitServerError, UpbitUnknownResultError):
+    """주문 등 상태를 바꾸는 요청에서 5xx를 받음. 거래소가 요청을 처리했는지 알 수 없다."""
+
+
+class UpbitResponseResultUnknownError(UpbitResponseError, UpbitUnknownResultError):
+    """주문 등 상태를 바꾸는 요청에 성공 응답을 받았지만 본문을 해석할 수 없음. 요청은 처리됐을 수 있다."""
 
 
 # 연결 단계에서 실패해 요청이 거래소에 가지 않은 것이 확실한 오류.
@@ -93,6 +109,8 @@ _NOT_SENT_ERRORS: tuple[type[httpx.TransportError], ...] = (
 _ERRORS_BY_STATUS: dict[int, type[UpbitError]] = {
     400: UpbitRequestError,
     401: UpbitAuthError,
+    403: UpbitForbiddenError,
+    404: UpbitNotFoundError,
     418: UpbitBlockedError,
     429: UpbitRateLimitError,
 }
@@ -232,14 +250,25 @@ class UpbitClient:
             return response.json()
         except ValueError as error:
             # JSON 형식 오류(JSONDecodeError)와 UTF-8이 아닌 본문(UnicodeDecodeError) 모두 ValueError다
-            raise UpbitResponseError(f"{method} {path} returned invalid JSON", status=response.status_code) from error
+            if method == "GET":
+                raise UpbitResponseError(
+                    f"{method} {path} returned invalid JSON", status=response.status_code
+                ) from error
+            # 주문 등은 성공 응답을 받았다면 이미 처리된 것이다. 못 읽었다고 실패로 보면 다시 보내 중복될 수 있다
+            raise UpbitResponseResultUnknownError(
+                f"{method} {path} returned invalid JSON; result unknown", status=response.status_code
+            ) from error
 
 
 def _to_error(method: str, path: str, response: httpx.Response) -> UpbitError:
     name, message = _parse_error_body(response)
     status = response.status_code
-    if status >= 500:
-        error_class: type[UpbitError] = UpbitServerError
+    if name == "out_of_scope":
+        # 업비트 문서: 권한 오류는 API에 따라 401 또는 403으로 오므로 이름으로도 구분한다
+        error_class: type[UpbitError] = UpbitForbiddenError
+    elif status >= 500:
+        # 조회는 다시 해도 되지만, 주문 등 상태를 바꾸는 요청은 5xx여도 처리됐을 수 있다
+        error_class = UpbitServerError if method == "GET" else UpbitServerResultUnknownError
     else:
         error_class = _ERRORS_BY_STATUS.get(status, UpbitError)
     return error_class(f"{method} {path} failed ({status} {name}): {message}", status=status, name=name)
