@@ -39,6 +39,9 @@ services:
       DB_NAME: ${DB_NAME}
       DB_USER: ${DB_USER}
       DB_PASSWORD: ${DB_PASSWORD}
+      # 업비트 API 키 (지금은 키 확인 명령에서만 쓴다). 없으면 빈 값
+      UPBIT_ACCESS_KEY: ${UPBIT_ACCESS_KEY:-}
+      UPBIT_SECRET_KEY: ${UPBIT_SECRET_KEY:-}
     volumes:
       - ./config/trading.json:/app/config/trading.json:ro
     logging: *logging
