@@ -231,13 +231,19 @@ class UpbitClient:
         if auth:
             if self._credentials is None:
                 raise RuntimeError("upbit credentials are required for this request")
-            if method != "GET":
-                raise NotImplementedError("authenticated POST is not supported yet")
-            # query_hash는 실제로 보내는 쿼리 문자열로 만들어야 하므로, 직접 붙여서 보낸다
-            query = encode_query(params) if params else ""
-            url = f"{path}?{query}" if query else path
-            headers["Authorization"] = authorization(self._credentials, query)
-            params = None
+            if method == "GET":
+                # query_hash는 실제로 보내는 쿼리 문자열로 만들어야 하므로, 직접 붙여서 보낸다
+                query = encode_query(params) if params else ""
+                url = f"{path}?{query}" if query else path
+                headers["Authorization"] = authorization(self._credentials, query)
+                params = None
+            else:
+                # 업비트 인증 문서: POST는 JSON 본문의 키·값을 같은 순서의 쿼리 문자열로 만들어 해시한다.
+                # 숫자를 그대로 두면 JSON과 해시의 표기가 달라질 수 있어 문자열만 받는다 (format_amount 사용)
+                body = params or {}
+                if any(not isinstance(value, str) for value in body.values()):
+                    raise TypeError(f"authenticated POST body values must be strings: {list(body)}")
+                headers["Authorization"] = authorization(self._credentials, encode_query(body) if body else "")
         try:
             # httpx의 timeout은 연결·쓰기·읽기 단계마다 따로 걸리므로, 요청 전체에도 한 번 더 건다
             async with asyncio.timeout(self._timeout):
@@ -379,3 +385,13 @@ def _amount(value: object) -> Decimal:
     if not amount.is_finite() or amount < 0:
         raise ValueError(f"amount must be a finite non-negative number: {value!r}")
     return amount
+
+
+def format_amount(value: Decimal) -> str:
+    """주문 금액·수량을 업비트에 보낼 문자열로 바꾼다. 지수 표기 없이 쓴다 (Decimal("1E-8") → "0.00000001").
+
+    0 이하·무한대·NaN이면 ValueError. 주문 금액이나 수량으로 쓸 수 없기 때문이다.
+    """
+    if not value.is_finite() or value <= 0:
+        raise ValueError(f"amount must be a positive finite number: {value!r}")
+    return format(value, "f")
