@@ -9,6 +9,7 @@ dependencies = [
     "httpx>=0.28.1",
     "numpy>=2.2.6",
     "ta-lib>=0.6.8",
+    "websockets>=17.3",
 ]
 
 [dependency-groups]
