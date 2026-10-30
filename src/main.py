@@ -9,9 +9,11 @@ from src.app.application import Application
 from src.app.config import ConfigError, TradingConfig, load_config
 from src.app.scheduler import CandleScheduler
 from src.connections.database import Database, DatabaseConfig
+from src.exchange.ticker_feed import TickerFeed
 from src.exchange.upbit_client import UpbitClient
 from src.repositories.market import MarketRepository
 from src.trading.market_worker import MarketWorker
+from src.trading.realtime_exit import RealtimeExit
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +52,10 @@ async def run(config_path: Path, config: TradingConfig, db_config: DatabaseConfi
                 job_factory=worker.candle_close_job,
             )
             app.add_service(f"scheduler:{config.timeframe}", scheduler.run)
+            # 캔들 마감 사이에는 현재가로 보유 중인 모의 포지션의 손절·익절만 판단한다 (매매 로직 5.1)
+            realtime_exit = RealtimeExit(database=database, market_ids=market_ids, submit=app.submit)
+            feed = TickerFeed(markets=config.markets, on_ticker=realtime_exit.on_ticker)
+            app.add_service("ticker", feed.run)
             await app.run()
     finally:
         await database.close()

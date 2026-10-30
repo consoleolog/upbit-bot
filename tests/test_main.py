@@ -90,7 +90,7 @@ def test_main_runs_application_with_scheduler(
 
     assert code == EXIT_OK
     run.assert_awaited_once()
-    assert add_service.call_args.args[1] == "scheduler:30m"
+    assert [call.args[1] for call in add_service.call_args_list] == ["scheduler:30m", "ticker"]
 
 
 def _record(mocker: MockerFixture, target: str, events: list[str], name: str, **kwargs: object) -> None:
@@ -129,6 +129,24 @@ async def test_run_passes_configured_settings_to_worker(mocker: MockerFixture) -
     kwargs = worker.call_args.kwargs
     assert kwargs["indicator_settings"] is config.indicator
     assert kwargs["signal_settings"] is config.signal
+
+
+async def test_run_feeds_tickers_to_realtime_exit(mocker: MockerFixture) -> None:
+    mocker.patch("src.main.Database.connect", new_callable=mocker.AsyncMock)
+    mocker.patch("src.main.Database.close", new_callable=mocker.AsyncMock)
+    mocker.patch("src.main.register_markets", new_callable=mocker.AsyncMock, return_value={"KRW-BTC": 1})
+    mocker.patch("src.main.Application.run", new_callable=mocker.AsyncMock)
+    feed = mocker.patch("src.main.TickerFeed")
+    realtime_exit = mocker.patch("src.main.RealtimeExit")
+    config = TradingConfig(timeframe=Timeframe.MINUTE_30, markets=("KRW-BTC",))
+
+    await run(Path("config.json"), config, DB_CONFIG)
+
+    # 현재가는 실시간 손절·익절로 가고, 판단 작업은 애플리케이션의 마켓 잠금을 거친다
+    assert feed.call_args.kwargs == {"markets": ("KRW-BTC",), "on_ticker": realtime_exit.return_value.on_ticker}
+    exit_kwargs = realtime_exit.call_args.kwargs
+    assert exit_kwargs["market_ids"] == {"KRW-BTC": 1}
+    assert exit_kwargs["submit"].__func__ is Application.submit
 
 
 async def test_run_closes_database_when_market_registration_fails(mocker: MockerFixture) -> None:
