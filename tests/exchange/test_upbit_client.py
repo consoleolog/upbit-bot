@@ -17,10 +17,14 @@ from src.exchange.upbit_client import (
     UpbitClient,
     UpbitConnectionError,
     UpbitError,
+    UpbitForbiddenError,
+    UpbitNotFoundError,
     UpbitRateLimitError,
     UpbitRequestError,
     UpbitResponseError,
+    UpbitResponseResultUnknownError,
     UpbitServerError,
+    UpbitServerResultUnknownError,
     UpbitTimeoutError,
     UpbitUnknownResultError,
     _parse_candle,
@@ -79,7 +83,9 @@ async def test_post_sends_json_body() -> None:
         (429, UpbitRateLimitError),
         (500, UpbitServerError),
         (503, UpbitServerError),
-        (404, UpbitError),
+        (403, UpbitForbiddenError),
+        (404, UpbitNotFoundError),
+        (409, UpbitError),
     ],
 )
 async def test_error_status_raises_matching_error(status: int, error_class: type[UpbitError]) -> None:
@@ -93,6 +99,54 @@ async def test_error_status_raises_matching_error(status: int, error_class: type
     assert exc_info.value.status == status
     assert exc_info.value.name == "some_error"
     assert "something wrong" in str(exc_info.value)
+
+
+@pytest.mark.parametrize("status", [401, 403])
+async def test_out_of_scope_is_forbidden_regardless_of_status(status: int) -> None:
+    # 업비트 문서: 권한 오류(out_of_scope)는 API에 따라 401 또는 403으로 온다
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status, json={"error": {"name": "out_of_scope", "message": "권한이 부족합니다."}})
+
+    with pytest.raises(UpbitForbiddenError) as exc_info:
+        await _request(handler)
+
+    assert (exc_info.value.status, exc_info.value.name) == (status, "out_of_scope")
+
+
+@pytest.mark.parametrize("status", [500, 502, 503])
+async def test_server_error_on_post_is_unknown_result(status: int) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status, text="error")
+
+    # 주문은 5xx를 받아도 처리됐을 수 있다. 실패로 보고 다시 보내면 중복 주문이 된다
+    with pytest.raises(UpbitServerResultUnknownError) as exc_info:
+        await _request(handler, method="POST", params={"market": "KRW-BTC"})
+
+    assert isinstance(exc_info.value, UpbitUnknownResultError)
+    assert isinstance(exc_info.value, UpbitServerError)
+
+
+async def test_server_error_on_get_is_not_unknown_result() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, text="error")
+
+    # 조회는 다시 해도 안전하므로 결과 모름으로 다루지 않는다
+    with pytest.raises(UpbitServerError) as exc_info:
+        await _request(handler)
+
+    assert not isinstance(exc_info.value, UpbitUnknownResultError)
+
+
+@pytest.mark.parametrize(("status", "error_class"), [(400, UpbitRequestError), (429, UpbitRateLimitError)])
+async def test_rejected_post_is_not_unknown_result(status: int, error_class: type[UpbitError]) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status, json={"error": {"name": "insufficient_funds_bid", "message": "잔고 부족"}})
+
+    # 거래소가 거부한 요청은 처리되지 않은 것이 확실하다
+    with pytest.raises(error_class) as exc_info:
+        await _request(handler, method="POST", params={"market": "KRW-BTC"})
+
+    assert not isinstance(exc_info.value, UpbitUnknownResultError)
 
 
 async def test_unknown_error_name_still_raises() -> None:
@@ -130,8 +184,23 @@ async def test_success_with_invalid_json() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, text="<html>maintenance</html>")
 
-    with pytest.raises(UpbitResponseError):
+    with pytest.raises(UpbitResponseError) as exc_info:
         await _request(handler)
+
+    assert not isinstance(exc_info.value, UpbitUnknownResultError)
+
+
+@pytest.mark.parametrize("body", [b"<html>maintenance</html>", b"\xff\xfe"])
+async def test_post_success_with_unreadable_body_is_unknown_result(body: bytes) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(201, content=body)
+
+    # 성공 응답이면 주문은 이미 만들어졌다. 본문을 못 읽었다고 실패로 보면 다시 보내 중복될 수 있다
+    with pytest.raises(UpbitResponseResultUnknownError) as exc_info:
+        await _request(handler, method="POST", params={"market": "KRW-BTC"})
+
+    assert isinstance(exc_info.value, UpbitUnknownResultError)
+    assert exc_info.value.status == 201
 
 
 @pytest.mark.parametrize(
