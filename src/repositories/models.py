@@ -173,3 +173,53 @@ class LiveOrder:
             paid_fee=row["paid_fee"],
             created_at=row["created_at"],
         )
+
+
+@dataclass(frozen=True, kw_only=True)
+class LivePosition:
+    """실거래 포지션. 매수 주문이 체결되면 만들고, 매도 주문이 체결될 때마다 매도 수량과 회수 금액을 더한다.
+
+    entry_cost는 매수 체결 금액 + 매수 수수료, sold_proceeds는 매도 체결 금액 - 매도 수수료다.
+    """
+
+    position_id: int
+    market_id: int
+    status: PositionStatus
+    # 매수할 때의 매도 기준(%) (매매 로직 2.3)
+    take_profit_rate: Decimal
+    stop_loss_rate: Decimal
+    min_profit_rate: Decimal
+    entry_volume: Decimal
+    entry_cost: Decimal
+    sold_volume: Decimal
+    sold_proceeds: Decimal
+    opened_at: datetime
+    closed_at: datetime | None
+    exit_reason: Reason | None
+
+    @property
+    def average_price(self) -> Decimal:
+        """매수 수수료를 포함한 평단가 (매매 로직 5.2)."""
+        return self.entry_cost / self.entry_volume
+
+    @property
+    def holding_volume(self) -> Decimal:
+        return self.entry_volume - self.sold_volume
+
+    @classmethod
+    def from_record(cls, row: asyncpg.Record) -> Self:
+        return cls(
+            position_id=row["position_id"],
+            market_id=row["market_id"],
+            status=PositionStatus(row["status"]),
+            take_profit_rate=row["take_profit_rate"],
+            stop_loss_rate=row["stop_loss_rate"],
+            min_profit_rate=row["min_profit_rate"],
+            entry_volume=row["entry_volume"],
+            entry_cost=row["entry_cost"],
+            sold_volume=row["sold_volume"],
+            sold_proceeds=row["sold_proceeds"],
+            opened_at=row["opened_at"],
+            closed_at=row["closed_at"],
+            exit_reason=None if row["exit_reason"] is None else Reason(row["exit_reason"]),
+        )
