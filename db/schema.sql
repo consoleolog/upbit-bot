@@ -1,4 +1,4 @@
--- upbit-bot 스키마. 지금까지 구현한 기능(마켓별 캔들 마감 때 보조지표 계산과 신호 판정)에 필요한 테이블만 둔다.
+-- upbit-bot 스키마. 지금까지 구현한 기능(지표·신호, 모의 매매, 실거래 주문·포지션)에 필요한 테이블만 둔다.
 
 -- 거래 대상 마켓
 CREATE TABLE market (
@@ -76,6 +76,82 @@ CREATE TABLE paper_position (
 
 -- 마켓당 열린 포지션은 하나 (매매 로직 5.1). 같은 마켓을 두 번 사는 것을 DB에서 막는다
 CREATE UNIQUE INDEX paper_position_open_market ON paper_position (market_id) WHERE status = 'OPEN';
+
+-- 실거래 주문. 거래소에 보내기 전에 기록하고, identifier를 업비트 주문의 identifier로 보낸다.
+-- 응답을 받지 못하거나 봇이 멈춰도 다시 보내지 않고 identifier로 거래소에 조회해 결과를 확인한다 (매매 로직 5.1).
+-- 시장가 주문만 쓴다: 매수(bid)는 원화 금액으로(업비트 ord_type=price), 매도(ask)는 수량으로(ord_type=market) 주문한다.
+-- 체결 결과는 주문이 끝났을 때 합계로 기록한다. executed_funds는 체결 금액 합계(수수료 제외)다.
+CREATE TABLE orders (
+    order_id         bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    market_id        int         NOT NULL REFERENCES market (market_id),
+    identifier       uuid        NOT NULL UNIQUE DEFAULT gen_random_uuid(),
+    side             varchar(3)  NOT NULL,
+    reason           varchar(20) NOT NULL,
+    -- pending: 기록했지만 거래소 접수를 아직 확인하지 못함. failed: 거래소가 접수하지 않음.
+    -- wait, done, cancel: 업비트 주문 상태
+    state            varchar(10) NOT NULL DEFAULT 'pending',
+    requested_amount numeric,
+    requested_volume numeric,
+    executed_volume  numeric     NOT NULL DEFAULT 0,
+    executed_funds   numeric     NOT NULL DEFAULT 0,
+    paid_fee         numeric     NOT NULL DEFAULT 0,
+    created_at       timestamptz NOT NULL DEFAULT now(),
+    CHECK (side IN ('bid', 'ask')),
+    CHECK (state IN ('pending', 'wait', 'done', 'cancel', 'failed')),
+    -- 매수는 신규 매수뿐이고, 매도는 손절·익절·신호 매도다
+    CHECK (
+        (side = 'bid' AND reason = 'ENTRY')
+        OR (side = 'ask' AND reason IN ('STOP_LOSS', 'TAKE_PROFIT', 'OVERBOUGHT_EXIT', 'DEAD_CROSS_EXIT'))
+    ),
+    -- 매수는 주문 금액만, 매도는 주문 수량만 있다. 체결은 주문한 만큼을 넘을 수 없다.
+    -- NULL과 비교하면 CHECK가 통과되므로 IS NOT NULL을 함께 쓴다
+    CHECK (
+        (side = 'bid' AND requested_amount IS NOT NULL AND requested_amount > 0 AND requested_volume IS NULL AND executed_funds <= requested_amount)
+        OR (side = 'ask' AND requested_volume IS NOT NULL AND requested_volume > 0 AND requested_amount IS NULL AND executed_volume <= requested_volume)
+    ),
+    CHECK (executed_volume >= 0 AND executed_funds >= 0 AND paid_fee >= 0),
+    -- 체결 수량과 금액은 함께 있거나 함께 없다
+    CHECK ((executed_volume = 0) = (executed_funds = 0)),
+    -- 거래소가 접수하지 않은 주문에는 체결이 없다
+    CHECK (state IN ('wait', 'done', 'cancel') OR (executed_volume = 0 AND paid_fee = 0))
+);
+
+-- 마켓당 끝나지 않은 주문은 하나 (매매 로직 5.1). 같은 마켓에 주문이 두 번 나가는 것을 DB에서 막는다
+CREATE UNIQUE INDEX orders_unfinished_market ON orders (market_id) WHERE state IN ('pending', 'wait');
+
+-- 실거래 포지션. 매수 주문이 체결되면 만들고, 매도 주문이 체결될 때마다 매도 수량과 회수 금액을 더한다.
+-- entry_cost는 매수 체결 금액 + 매수 수수료, sold_proceeds는 매도 체결 금액 - 매도 수수료다.
+-- 평단가(entry_cost / entry_volume)와 보유 수량(entry_volume - sold_volume)은 모델에서 계산한다.
+CREATE TABLE position (
+    position_id      bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    market_id        int         NOT NULL REFERENCES market (market_id),
+    status           varchar(10) NOT NULL DEFAULT 'OPEN',
+    -- 매수할 때의 매도 기준(%). 보유 중에 설정을 바꿔도 이 포지션은 이 값을 끝까지 쓴다 (매매 로직 2.3)
+    take_profit_rate numeric     NOT NULL,
+    stop_loss_rate   numeric     NOT NULL,
+    min_profit_rate  numeric     NOT NULL,
+    entry_volume     numeric     NOT NULL,
+    entry_cost       numeric     NOT NULL,
+    sold_volume      numeric     NOT NULL DEFAULT 0,
+    sold_proceeds    numeric     NOT NULL DEFAULT 0,
+    opened_at        timestamptz NOT NULL,
+    closed_at        timestamptz,
+    exit_reason      varchar(20),
+    CHECK (status IN ('OPEN', 'CLOSED')),
+    CHECK (take_profit_rate > 0 AND stop_loss_rate > 0 AND min_profit_rate >= 0),
+    CHECK (entry_volume > 0 AND entry_cost > 0),
+    -- 보유한 것보다 많이 팔 수 없다
+    CHECK (sold_volume >= 0 AND sold_volume <= entry_volume AND sold_proceeds >= 0),
+    CHECK (exit_reason IN ('STOP_LOSS', 'TAKE_PROFIT', 'OVERBOUGHT_EXIT', 'DEAD_CROSS_EXIT')),
+    -- 열린 포지션은 종료 정보가 없고, 닫힌 포지션은 모두 있다
+    CHECK (
+        (status = 'OPEN' AND closed_at IS NULL AND exit_reason IS NULL)
+        OR (status = 'CLOSED' AND closed_at IS NOT NULL AND closed_at >= opened_at AND exit_reason IS NOT NULL)
+    )
+);
+
+-- 마켓당 열린 포지션은 하나 (매매 로직 5.1). 같은 마켓을 두 번 사는 것을 DB에서 막는다
+CREATE UNIQUE INDEX position_open_market ON position (market_id) WHERE status = 'OPEN';
 
 CREATE FUNCTION set_updated_at() RETURNS trigger
 LANGUAGE plpgsql AS $$
