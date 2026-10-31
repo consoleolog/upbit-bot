@@ -9,6 +9,7 @@ from typing import Self
 
 import asyncpg
 
+from src.exchange.order import OrderSide
 from src.trading.reasons import Reason
 from src.trading.signals import CrossState, OverState
 
@@ -124,4 +125,51 @@ class PaperPosition:
             exit_price=row["exit_price"],
             exit_reason=None if row["exit_reason"] is None else Reason(row["exit_reason"]),
             net_profit_rate=row["net_profit_rate"],
+        )
+
+
+class LiveOrderState(StrEnum):
+    PENDING = "pending"  # 기록했지만 거래소 접수를 아직 확인하지 못함
+    WAIT = "wait"  # 거래소가 접수했고 체결 중
+    DONE = "done"
+    CANCEL = "cancel"  # 시장가 주문은 일부만 체결되고 남은 양이 취소돼도 cancel이다
+    FAILED = "failed"  # 거래소가 접수하지 않음
+
+
+@dataclass(frozen=True, kw_only=True)
+class LiveOrder:
+    """실거래 주문. identifier를 업비트 주문의 identifier로 보낸다.
+
+    매수(bid)는 requested_amount(원화), 매도(ask)는 requested_volume(수량)으로 주문한다.
+    executed_funds는 체결 금액 합계(수수료 제외), paid_fee는 거래소가 청구한 수수료다.
+    """
+
+    order_id: int
+    market_id: int
+    identifier: str
+    side: OrderSide
+    reason: Reason
+    state: LiveOrderState
+    requested_amount: Decimal | None
+    requested_volume: Decimal | None
+    executed_volume: Decimal
+    executed_funds: Decimal
+    paid_fee: Decimal
+    created_at: datetime
+
+    @classmethod
+    def from_record(cls, row: asyncpg.Record) -> Self:
+        return cls(
+            order_id=row["order_id"],
+            market_id=row["market_id"],
+            identifier=str(row["identifier"]),
+            side=OrderSide(row["side"]),
+            reason=Reason(row["reason"]),
+            state=LiveOrderState(row["state"]),
+            requested_amount=row["requested_amount"],
+            requested_volume=row["requested_volume"],
+            executed_volume=row["executed_volume"],
+            executed_funds=row["executed_funds"],
+            paid_fee=row["paid_fee"],
+            created_at=row["created_at"],
         )
