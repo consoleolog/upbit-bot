@@ -9,6 +9,7 @@ import httpx
 from src.app.config import Timeframe
 from src.exchange.account import Account, OrderChance
 from src.exchange.candle import Candle
+from src.exchange.order import Order, OrderSide, OrderState, OrderType, Trade, validate_identifier
 from src.exchange.rate_limiter import RateLimiter
 from src.exchange.upbit_auth import UpbitCredentials, authorization, encode_query
 
@@ -217,6 +218,68 @@ class UpbitClient:
             raise UpbitResponseError(f"order chance does not match request ({market}): {chance.market}")
         return chance
 
+    async def place_market_buy(self, market: str, krw_amount: Decimal, identifier: str) -> Order:
+        """원화 총액 krw_amount만큼 시장가로 매수한다. 실제 주문이다.
+
+        다시 보내지 않는다. UpbitUnknownResultError면 주문이 접수됐을 수 있으므로 get_order(identifier)로 확인한다.
+        """
+        body = _market_buy_body(market, krw_amount, identifier)
+        await self._order_limiter.acquire()
+        return await self._create_order("/v1/orders", body)
+
+    async def place_market_sell(self, market: str, volume: Decimal, identifier: str) -> Order:
+        """수량 volume만큼 시장가로 매도한다. 실제 주문이다. 실패했을 때는 place_market_buy와 같다."""
+        body = _market_sell_body(market, volume, identifier)
+        await self._order_limiter.acquire()
+        return await self._create_order("/v1/orders", body)
+
+    async def test_market_buy(self, market: str, krw_amount: Decimal, identifier: str) -> Order:
+        """시장가 매수 요청을 검증만 한다 (주문 생성 테스트). 주문은 만들어지지 않는다. 주문하기 권한이 필요하다."""
+        body = _market_buy_body(market, krw_amount, identifier)
+        await self._order_test_limiter.acquire()
+        return await self._create_order("/v1/orders/test", body)
+
+    async def test_market_sell(self, market: str, volume: Decimal, identifier: str) -> Order:
+        """시장가 매도 요청을 검증만 한다 (주문 생성 테스트). 주문은 만들어지지 않는다. 주문하기 권한이 필요하다."""
+        body = _market_sell_body(market, volume, identifier)
+        await self._order_test_limiter.acquire()
+        return await self._create_order("/v1/orders/test", body)
+
+    async def get_order(self, identifier: str) -> Order | None:
+        """identifier로 주문을 조회한다. 그런 주문이 없으면(404 order_not_found) None, 그 밖의 실패는 예외."""
+        validate_identifier(identifier)
+        await self._default_limiter.acquire()
+        try:
+            raw = await self._request("GET", "/v1/order", {"identifier": identifier}, auth=True)
+        except UpbitNotFoundError as error:
+            # 주문이 없다는 확인만 None으로 바꾼다. 다른 이유의 404는 없다고 단정할 수 없다
+            if error.name == "order_not_found":
+                return None
+            raise
+        try:
+            order = _parse_order(raw)
+        except (KeyError, TypeError, ValueError, ArithmeticError) as error:
+            raise UpbitResponseError(f"invalid upbit order: {raw!r}") from error
+        if order.identifier != identifier:
+            raise UpbitResponseError(f"order does not match request (identifier={identifier}): {order.identifier}")
+        return order
+
+    async def _create_order(self, path: str, body: dict[str, str]) -> Order:
+        raw = await self._request("POST", path, body, auth=True)
+        # 성공 응답(201)을 받았으면 주문은 이미 접수됐다. 응답을 믿을 수 없으면 실패가 아니라 결과 모름으로 올려
+        # 호출하는 쪽이 다시 보내지 않고 identifier로 조회하게 한다
+        try:
+            order = _parse_order(raw)
+        except (KeyError, TypeError, ValueError, ArithmeticError) as error:
+            raise UpbitResponseResultUnknownError(f"POST {path} returned invalid order; result unknown") from error
+        expected = (body["market"], body["side"], body["ord_type"], body["identifier"])
+        actual = (order.market, order.side, order.ord_type, order.identifier)
+        if actual != expected:
+            raise UpbitResponseResultUnknownError(
+                f"POST {path} returned order not matching request; result unknown: {actual} != {expected}"
+            )
+        return order
+
     async def _request(
         self, method: Method, path: str, params: dict[str, Any] | None = None, *, auth: bool = False
     ) -> Any:
@@ -374,6 +437,91 @@ def _parse_order_chance(raw: object) -> OrderChance:
         return chance
     except (KeyError, TypeError, ValueError, ArithmeticError) as error:
         raise UpbitResponseError(f"invalid upbit order chance: {raw!r}") from error
+
+
+def _market_buy_body(market: str, krw_amount: Decimal, identifier: str) -> dict[str, str]:
+    # 업비트 문서 "주문 생성": 시장가 매수는 ord_type=price, price에 원화 총액을 넣고 volume은 넣지 않는다
+    validate_identifier(identifier)
+    return {
+        "market": market,
+        "side": OrderSide.BID,
+        "ord_type": OrderType.PRICE,
+        "price": format_amount(krw_amount),
+        "identifier": identifier,
+    }
+
+
+def _market_sell_body(market: str, volume: Decimal, identifier: str) -> dict[str, str]:
+    # 업비트 문서 "주문 생성": 시장가 매도는 ord_type=market, volume에 수량을 넣고 price는 넣지 않는다
+    validate_identifier(identifier)
+    return {
+        "market": market,
+        "side": OrderSide.ASK,
+        "ord_type": OrderType.MARKET,
+        "volume": format_amount(volume),
+        "identifier": identifier,
+    }
+
+
+def _parse_order(raw: object) -> Order:
+    """업비트 주문 응답(주문 생성·조회)을 Order로 바꾼다. 형식이나 값이 잘못되면 KeyError, TypeError, ValueError.
+
+    어떤 예외로 바꿀지는 호출하는 쪽이 정한다 (주문 생성이면 결과 모름).
+    """
+    if not isinstance(raw, dict):
+        raise TypeError(f"order must be an object: {type(raw).__name__}")
+    for key in ("uuid", "market"):
+        if not isinstance(raw[key], str) or not raw[key]:
+            raise TypeError(f"{key} must be a non-empty string")
+    identifier = raw.get("identifier")
+    if identifier is not None and not isinstance(identifier, str):
+        raise TypeError("identifier must be a string")
+    trades_count = raw["trades_count"]
+    if isinstance(trades_count, bool) or not isinstance(trades_count, int) or trades_count < 0:
+        raise TypeError(f"trades_count must be a non-negative integer: {trades_count!r}")
+    trades = raw.get("trades", [])
+    if not isinstance(trades, list):
+        raise TypeError("trades must be a list")
+    return Order(
+        uuid=raw["uuid"],
+        identifier=identifier,
+        market=raw["market"],
+        side=OrderSide(raw["side"]),
+        ord_type=OrderType(raw["ord_type"]),
+        state=OrderState(raw["state"]),
+        created_at=_aware_time(raw["created_at"]),
+        price=_optional_amount(raw.get("price")),
+        volume=_optional_amount(raw.get("volume")),
+        executed_volume=_amount(raw["executed_volume"]),
+        paid_fee=_amount(raw["paid_fee"]),
+        trades_count=trades_count,
+        trades=tuple(_parse_trade(trade) for trade in trades),
+    )
+
+
+def _parse_trade(raw: object) -> Trade:
+    if not isinstance(raw, dict):
+        raise TypeError(f"trade must be an object: {type(raw).__name__}")
+    return Trade(
+        price=_amount(raw["price"]),
+        volume=_amount(raw["volume"]),
+        funds=_amount(raw["funds"]),
+        created_at=_aware_time(raw["created_at"]),
+    )
+
+
+def _aware_time(value: object) -> datetime:
+    """업비트 주문 시각(예: "2025-08-09T16:44:00+09:00")을 시간대 있는 datetime으로 바꾼다."""
+    if not isinstance(value, str):
+        raise TypeError(f"time must be a string: {value!r}")
+    time = datetime.fromisoformat(value)
+    if time.tzinfo is None:
+        raise ValueError(f"time must have a timezone: {value!r}")
+    return time
+
+
+def _optional_amount(value: object) -> Decimal | None:
+    return None if value is None else _amount(value)
 
 
 def _amount(value: object) -> Decimal:
