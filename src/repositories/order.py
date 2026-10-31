@@ -5,6 +5,7 @@ import asyncpg
 from src.exchange.order import OrderSide
 from src.repositories.errors import NotFoundError
 from src.repositories.models import LiveOrder, LiveOrderState
+from src.repositories.values import check_decimal
 from src.trading.reasons import Reason
 
 # 마켓당 끝나지 않은 주문은 하나다 (orders_unfinished_market 인덱스). 이미 있으면 기록하지 않는다
@@ -16,19 +17,13 @@ _INSERT = """
 """
 
 
-def _check(name: str, value: Decimal, *, positive: bool) -> None:
-    # PostgreSQL numeric은 NaN과 Infinity를 받고, 둘 다 "> 0" 비교를 통과해 CHECK로는 막히지 않는다
-    if not value.is_finite() or value < 0 or (positive and value == 0):
-        raise ValueError(f"{name} must be a finite {'positive' if positive else 'non-negative'} number: {value!r}")
-
-
 class OrderRepository:
     async def create_buy(self, conn: asyncpg.Connection, *, market_id: int, amount: Decimal) -> LiveOrder | None:
         """원화 amount의 신규 매수 주문을 거래소에 보내기 전에 기록한다.
 
         마켓에 끝나지 않은 주문이 있으면 기록하지 않고 None. 그때는 주문을 보내지 않는다.
         """
-        _check("amount", amount, positive=True)
+        check_decimal("amount", amount, positive=True)
         row = await conn.fetchrow(_INSERT, market_id, OrderSide.BID, Reason.ENTRY, amount, None)
         return None if row is None else LiveOrder.from_record(row)
 
@@ -36,7 +31,7 @@ class OrderRepository:
         self, conn: asyncpg.Connection, *, market_id: int, volume: Decimal, reason: Reason
     ) -> LiveOrder | None:
         """수량 volume의 매도 주문을 거래소에 보내기 전에 기록한다. 끝나지 않은 주문이 있으면 create_buy와 같다."""
-        _check("volume", volume, positive=True)
+        check_decimal("volume", volume, positive=True)
         row = await conn.fetchrow(_INSERT, market_id, OrderSide.ASK, reason, None, volume)
         return None if row is None else LiveOrder.from_record(row)
 
@@ -68,7 +63,7 @@ class OrderRepository:
             ("executed_funds", executed_funds),
             ("paid_fee", paid_fee),
         ):
-            _check(name, value, positive=False)
+            check_decimal(name, value, positive=False)
         row = await conn.fetchrow(
             """
             UPDATE orders
