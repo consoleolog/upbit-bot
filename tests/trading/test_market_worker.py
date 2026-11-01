@@ -530,3 +530,78 @@ async def test_job_logs_paper_trade(
     await _worker(FakeUpbit(candles), database, {symbol: market_id}).candle_close_job(symbol, CLOSE)()
 
     assert f"paper BUY (market={symbol}, reason=ENTRY" in caplog.text
+
+
+class FakeLive:
+    """실거래 판단 대신 호출을 기록한다. 호출될 때 지표·신호가 이미 커밋됐는지도 확인한다."""
+
+    def __init__(self, database: Database) -> None:
+        self.database = database
+        self.calls: list[tuple[str, int, Candle, bool]] = []
+        self.committed: list[bool] = []
+
+    async def on_candle(
+        self,
+        market: str,
+        market_id: int,
+        *,
+        candle: Candle,
+        states: dict[IndicatorType, IndicatorInfo],
+        allow_buy: bool,
+    ) -> None:
+        self.calls.append((market, market_id, candle, allow_buy))
+        # 다른 커넥션에서 보이면 커밋된 것이다. 거래소를 호출하는 판단은 트랜잭션 밖에서 해야 한다
+        self.committed.append(await _saved(self.database, market_id) == states)
+
+
+@pytest.mark.integration
+async def test_live_judges_after_commit_instead_of_paper(
+    database: Database, market: tuple[str, int], mocker: MockerFixture
+) -> None:
+    symbol, market_id = market
+    paper = mocker.patch("src.trading.market_worker.apply_paper_decision", new_callable=mocker.AsyncMock)
+    close = datetime(2026, 1, 10, 0, 0, tzinfo=UTC)
+    candles = _candles(symbol, 200, close)
+    live = FakeLive(database)
+    worker = MarketWorker(
+        upbit=FakeUpbit(candles),
+        database=database,
+        timeframe=Timeframe.MINUTE_30,
+        indicator_settings=IndicatorSettings(),
+        signal_settings=SignalSettings(),
+        exit_settings=ExitSettings(),
+        stochastic_entry_max=50.0,
+        market_ids={symbol: market_id},
+        live=live,  # type: ignore[arg-type]
+    )
+
+    await worker.candle_close_job(symbol, close)()
+    # 이미 처리한 마감이면 다시 판단하지 않는다
+    await worker.candle_close_job(symbol, close)()
+
+    assert live.calls == [(symbol, market_id, candles[-1], True)]
+    assert live.committed == [True]
+    # 실거래일 때는 모의 실행으로 판단하지 않는다. 둘 다 하면 서로의 신호 상태를 지운다
+    paper.assert_not_awaited()
+
+
+@pytest.mark.integration
+async def test_live_does_not_buy_with_short_window(database: Database, market: tuple[str, int]) -> None:
+    symbol, market_id = market
+    close = datetime(2026, 1, 10, 0, 0, tzinfo=UTC)
+    live = FakeLive(database)
+    worker = MarketWorker(
+        upbit=FakeUpbit(_candles(symbol, MIN_CANDLES_FOR_SIGNAL - 1, close)),
+        database=database,
+        timeframe=Timeframe.MINUTE_30,
+        indicator_settings=IndicatorSettings(),
+        signal_settings=SignalSettings(),
+        exit_settings=ExitSettings(),
+        stochastic_entry_max=50.0,
+        market_ids={symbol: market_id},
+        live=live,  # type: ignore[arg-type]
+    )
+
+    await worker.candle_close_job(symbol, close)()
+
+    assert [allow_buy for *_, allow_buy in live.calls] == [False]

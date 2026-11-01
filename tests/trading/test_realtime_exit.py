@@ -147,3 +147,15 @@ async def test_check_sells_on_stop_loss_and_logs(database: Database, caplog: pyt
         async with database.transaction() as conn:
             await conn.execute("DELETE FROM paper_position WHERE market_id = $1", market.market_id)
             await conn.execute("DELETE FROM market WHERE market_id = $1", market.market_id)
+
+
+async def test_live_checks_live_position_instead_of_paper(mocker: MockerFixture) -> None:
+    database = MagicMock()
+    live = mocker.AsyncMock()
+    realtime = RealtimeExit(database=database, market_ids={"KRW-BTC": 1}, submit=Submitted(), live=live)
+
+    await realtime.check("KRW-BTC", _ticker("98"))
+
+    # 실거래는 거래소를 호출하므로 여기서 트랜잭션을 열지 않고 실거래 판단에 넘긴다
+    live.on_ticker.assert_awaited_once_with("KRW-BTC", 1, _ticker("98"))
+    database.transaction.assert_not_called()

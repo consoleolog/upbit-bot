@@ -296,3 +296,33 @@ def test_main_live_check_failure_exits_with_startup_failed(
 
     assert main(["--config", str(config)]) == EXIT_STARTUP_FAILED
     stubs["run"].assert_not_awaited()  # type: ignore[attr-defined]
+
+
+async def test_live_run_passes_live_trader_to_worker_and_realtime_exit(mocker: MockerFixture) -> None:
+    _stub_startup(mocker)
+    worker = mocker.patch("src.main.MarketWorker")
+    realtime_exit = mocker.patch("src.main.RealtimeExit")
+    trader = mocker.patch("src.main.LiveTrader")
+    executor = mocker.patch("src.main.LiveExecutor")
+
+    await run(Path("config.json"), LIVE, DB_CONFIG, CREDENTIALS)
+
+    # 시작할 때 받은 마켓별 수수료·최소 주문 금액으로 판단하고 주문한다
+    assert trader.call_args.kwargs["chances"] == {"KRW-BTC": _chance("KRW-BTC"), "KRW-ETH": _chance("KRW-ETH")}
+    assert trader.call_args.kwargs["buy_ratio"] == LIVE.order.buy_ratio
+    assert executor.call_args.kwargs["ask_min_totals"] == {"KRW-BTC": Decimal("5000"), "KRW-ETH": Decimal("5000")}
+    assert worker.call_args.kwargs["live"] is trader.return_value
+    assert realtime_exit.call_args.kwargs["live"] is trader.return_value
+
+
+async def test_paper_run_has_no_live_trader(mocker: MockerFixture) -> None:
+    _stub_startup(mocker)
+    worker = mocker.patch("src.main.MarketWorker")
+    realtime_exit = mocker.patch("src.main.RealtimeExit")
+    trader = mocker.patch("src.main.LiveTrader")
+
+    await run(Path("config.json"), TradingConfig(timeframe=Timeframe.MINUTE_30, markets=("KRW-BTC",)), DB_CONFIG)
+
+    trader.assert_not_called()
+    assert worker.call_args.kwargs["live"] is None
+    assert realtime_exit.call_args.kwargs["live"] is None
