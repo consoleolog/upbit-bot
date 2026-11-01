@@ -1,4 +1,5 @@
 import uuid
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
@@ -7,7 +8,10 @@ from pytest_mock import MockerFixture
 from src.app.application import Application
 from src.app.config import Timeframe, TradingConfig
 from src.connections.database import Database, DatabaseConfig
-from src.main import EXIT_OK, EXIT_STARTUP_FAILED, main, parse_args, register_markets, run
+from src.exchange.account import Account, OrderChance
+from src.exchange.upbit_auth import UpbitCredentials
+from src.exchange.upbit_client import UpbitAuthError
+from src.main import EXIT_OK, EXIT_STARTUP_FAILED, StartupError, main, parse_args, register_markets, run
 from src.trading.indicators import IndicatorSettings
 from src.trading.signals import SignalSettings, Threshold
 
@@ -174,3 +178,121 @@ async def test_register_markets_is_idempotent(database: Database) -> None:
     finally:
         async with database.transaction() as conn:
             await conn.execute("DELETE FROM market WHERE symbol = ANY($1::text[])", symbols)
+
+
+CREDENTIALS = UpbitCredentials(access_key="access-value", secret_key="secret-value-" + "x" * 64)
+LIVE = TradingConfig(timeframe=Timeframe.MINUTE_30, markets=("KRW-BTC", "KRW-ETH"), live=True)
+
+
+def _chance(market: str, state: str = "active") -> OrderChance:
+    return OrderChance(
+        market=market,
+        bid_fee=Decimal("0.0005"),
+        ask_fee=Decimal("0.0005"),
+        bid_min_total=Decimal("5000"),
+        ask_min_total=Decimal("5000"),
+        max_total=Decimal("1000000000"),
+        state=state,
+    )
+
+
+def _stub_startup(mocker: MockerFixture) -> dict[str, object]:
+    mocker.patch("src.main.Database.connect", new_callable=mocker.AsyncMock)
+    mocker.patch("src.main.Database.close", new_callable=mocker.AsyncMock)
+    mocker.patch("src.main.register_markets", new_callable=mocker.AsyncMock, return_value={"KRW-BTC": 1, "KRW-ETH": 2})
+    account = Account(
+        currency="KRW", balance=Decimal("10000"), locked=Decimal(0), avg_buy_price=Decimal(0), unit_currency="KRW"
+    )
+    return {
+        "run": mocker.patch("src.main.Application.run", new_callable=mocker.AsyncMock),
+        "accounts": mocker.patch(
+            "src.main.UpbitClient.get_accounts", new_callable=mocker.AsyncMock, return_value=[account]
+        ),
+        "chance": mocker.patch(
+            "src.main.UpbitClient.get_order_chance", new_callable=mocker.AsyncMock, side_effect=_chance
+        ),
+    }
+
+
+async def test_live_run_checks_account_and_markets_before_starting(mocker: MockerFixture) -> None:
+    stubs = _stub_startup(mocker)
+
+    await run(Path("config.json"), LIVE, DB_CONFIG, CREDENTIALS)
+
+    stubs["accounts"].assert_awaited_once()  # type: ignore[attr-defined]
+    assert [call.args[0] for call in stubs["chance"].await_args_list] == ["KRW-BTC", "KRW-ETH"]  # type: ignore[attr-defined]
+    stubs["run"].assert_awaited_once()  # type: ignore[attr-defined]
+
+
+async def test_paper_run_does_not_touch_account(mocker: MockerFixture) -> None:
+    stubs = _stub_startup(mocker)
+
+    await run(Path("config.json"), TradingConfig(timeframe=Timeframe.MINUTE_30, markets=("KRW-BTC",)), DB_CONFIG)
+
+    stubs["accounts"].assert_not_awaited()  # type: ignore[attr-defined]
+    stubs["run"].assert_awaited_once()  # type: ignore[attr-defined]
+
+
+async def test_live_run_without_credentials_does_not_start(mocker: MockerFixture) -> None:
+    stubs = _stub_startup(mocker)
+
+    with pytest.raises(StartupError, match="credentials"):
+        await run(Path("config.json"), LIVE, DB_CONFIG)
+
+    stubs["run"].assert_not_awaited()  # type: ignore[attr-defined]
+
+
+async def test_live_run_stops_when_account_check_fails(mocker: MockerFixture) -> None:
+    stubs = _stub_startup(mocker)
+    stubs["accounts"].side_effect = UpbitAuthError(  # type: ignore[attr-defined]
+        "GET /v1/accounts failed (401 no_authorization_ip): ", status=401, name="no_authorization_ip"
+    )
+
+    with pytest.raises(StartupError, match="no_authorization_ip") as error:
+        await run(Path("config.json"), LIVE, DB_CONFIG, CREDENTIALS)
+
+    stubs["run"].assert_not_awaited()  # type: ignore[attr-defined]
+    assert CREDENTIALS.secret_key not in str(error.value)
+
+
+async def test_live_run_stops_when_market_not_tradable(mocker: MockerFixture) -> None:
+    stubs = _stub_startup(mocker)
+    stubs["chance"].side_effect = lambda market: _chance(market, "delisted" if market == "KRW-ETH" else "active")  # type: ignore[attr-defined]
+
+    with pytest.raises(StartupError, match="KRW-ETH"):
+        await run(Path("config.json"), LIVE, DB_CONFIG, CREDENTIALS)
+
+    stubs["run"].assert_not_awaited()  # type: ignore[attr-defined]
+
+
+def _live_main_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    config = tmp_path / "config.json"
+    config.write_text('{"timeframe": "30m", "markets": ["KRW-BTC"], "live": true}', encoding="utf-8")
+    for key, value in DB_ENV.items():
+        monkeypatch.setenv(key, value)
+    return config
+
+
+def test_main_live_without_keys_fails_before_connecting(
+    tmp_path: Path, mocker: MockerFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _live_main_env(tmp_path, monkeypatch)
+    monkeypatch.delenv("UPBIT_ACCESS_KEY", raising=False)
+    monkeypatch.delenv("UPBIT_SECRET_KEY", raising=False)
+    connect = mocker.patch("src.main.Database.connect")
+
+    assert main(["--config", str(config)]) == EXIT_STARTUP_FAILED
+    connect.assert_not_called()
+
+
+def test_main_live_check_failure_exits_with_startup_failed(
+    tmp_path: Path, mocker: MockerFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _live_main_env(tmp_path, monkeypatch)
+    monkeypatch.setenv("UPBIT_ACCESS_KEY", CREDENTIALS.access_key)
+    monkeypatch.setenv("UPBIT_SECRET_KEY", CREDENTIALS.secret_key)
+    stubs = _stub_startup(mocker)
+    stubs["accounts"].side_effect = UpbitAuthError("401 invalid_access_key", status=401, name="invalid_access_key")  # type: ignore[attr-defined]
+
+    assert main(["--config", str(config)]) == EXIT_STARTUP_FAILED
+    stubs["run"].assert_not_awaited()  # type: ignore[attr-defined]

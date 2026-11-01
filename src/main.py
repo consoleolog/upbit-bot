@@ -9,8 +9,10 @@ from src.app.application import Application
 from src.app.config import ConfigError, TradingConfig, load_config
 from src.app.scheduler import CandleScheduler
 from src.connections.database import Database, DatabaseConfig
+from src.exchange.account import MARKET_STATE_ACTIVE
 from src.exchange.ticker_feed import TickerFeed
-from src.exchange.upbit_client import UpbitClient
+from src.exchange.upbit_auth import UpbitCredentials
+from src.exchange.upbit_client import UpbitClient, UpbitError
 from src.repositories.market import MarketRepository
 from src.trading.market_worker import MarketWorker
 from src.trading.realtime_exit import RealtimeExit
@@ -21,19 +23,31 @@ EXIT_OK = 0
 EXIT_STARTUP_FAILED = 1
 
 
+class StartupError(Exception):
+    """매매를 시작하기 전 확인에 실패함. 봇을 시작하지 않는다."""
+
+
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(prog="upbit-bot", description="업비트 자동매매 봇")
     parser.add_argument("--config", type=Path, required=True, help="설정 파일 경로")
     return parser.parse_args(argv)
 
 
-async def run(config_path: Path, config: TradingConfig, db_config: DatabaseConfig) -> None:
+async def run(
+    config_path: Path, config: TradingConfig, db_config: DatabaseConfig, credentials: UpbitCredentials | None = None
+) -> None:
+    """봇을 실행한다. 실거래(config.live)면 credentials가 있어야 하고, 시작 전에 업비트 계좌를 확인한다."""
+    if config.live and credentials is None:
+        raise StartupError("live trading needs upbit credentials")
     database = Database(db_config)
     await database.connect()
     # 연결은 애플리케이션이 작업을 모두 정리한 뒤에 닫는다 (업비트 → DB 순서)
     try:
         market_ids = await register_markets(database, config.markets)
-        async with UpbitClient() as upbit:
+        async with UpbitClient(credentials=credentials) as upbit:
+            if config.live:
+                await check_live_account(upbit, config.markets)
+            logger.info("trading mode: %s", "live" if config.live else "paper")
             app = Application(config_path)
             worker = MarketWorker(
                 upbit=upbit,
@@ -61,6 +75,19 @@ async def run(config_path: Path, config: TradingConfig, db_config: DatabaseConfi
         await database.close()
 
 
+async def check_live_account(upbit: UpbitClient, markets: Sequence[str]) -> None:
+    """실거래를 시작하기 전에 키(권한·허용 IP)와 마켓별 주문 가능 여부를 확인한다. 실패하면 StartupError."""
+    try:
+        await upbit.get_accounts()
+        for market in markets:
+            chance = await upbit.get_order_chance(market)
+            if chance.state != MARKET_STATE_ACTIVE:
+                raise StartupError(f"market is not tradable: {market} (state={chance.state})")
+    except UpbitError as error:
+        # 오류 메시지에는 키가 들어가지 않는다 (UpbitClient가 쿼리·헤더를 넣지 않음)
+        raise StartupError(f"upbit account check failed: {error}") from error
+
+
 async def register_markets(database: Database, markets: Sequence[str]) -> dict[str, int]:
     """설정의 마켓을 등록하고(이미 있으면 그대로) 마켓 코드별 market_id를 돌려준다."""
     repo = MarketRepository()
@@ -86,7 +113,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         logger.error("invalid database config: %s", error)
         return EXIT_STARTUP_FAILED
 
-    asyncio.run(run(args.config, config, db_config))
+    credentials = None
+    if config.live:
+        try:
+            credentials = UpbitCredentials.from_env()
+        except ValueError as error:
+            logger.error("invalid upbit credentials: %s", error)
+            return EXIT_STARTUP_FAILED
+
+    try:
+        asyncio.run(run(args.config, config, db_config, credentials))
+    except StartupError as error:
+        logger.error("startup check failed: %s", error)
+        return EXIT_STARTUP_FAILED
     return EXIT_OK
 
 

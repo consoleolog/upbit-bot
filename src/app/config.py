@@ -62,6 +62,8 @@ class TradingConfig:
     stochastic_entry_max: float = 50.0
     order: OrderSettings = field(default_factory=OrderSettings)
     exit: ExitSettings = field(default_factory=ExitSettings)
+    # True면 업비트에 실제 주문을 낸다. 기본은 모의 실행이다. 모의 실행과 실거래는 신호 상태를 함께 쓰므로 둘 중 하나만 한다
+    live: bool = False
 
 
 def load_config(path: Path) -> TradingConfig:
@@ -72,7 +74,7 @@ def load_config(path: Path) -> TradingConfig:
         raise ConfigError(f"cannot read config file: {path}") from error
     except json.JSONDecodeError as error:
         raise ConfigError(f"config file is not valid JSON: {path}") from error
-    root = _object(raw, "config", {"timeframe", "markets", "indicator", "threshold", "order", "exit"})
+    root = _object(raw, "config", {"timeframe", "markets", "indicator", "threshold", "order", "exit", "live"})
     indicator = _object(root.get("indicator", {}), "indicator", {"ema", "macd_signal", "rsi", "stochastic"})
     threshold = _object(root.get("threshold", {}), "threshold", {"rsi", "stochastic", "stochastic_entry_max"})
     order = _object(root.get("order", {}), "order", {"buy_ratio"})
@@ -90,12 +92,20 @@ def load_config(path: Path) -> TradingConfig:
             stochastic_entry_max=_percent(threshold, "stochastic_entry_max", 50.0),
             order=_parse_order(order),
             exit=_parse_exit(exit_),
+            live=_parse_live(root.get("live", False)),
         )
     except ConfigError:
         raise
     except ValueError as error:
         # 설정 클래스의 검증 오류(ValueError)도 설정 오류로 알린다
         raise ConfigError(str(error)) from error
+
+
+def _parse_live(value: object) -> bool:
+    # 실제 돈이 오가는 설정이라 "true", 1 같은 값을 참으로 해석하지 않는다
+    if not isinstance(value, bool):
+        raise ConfigError(f"live must be true or false: {value!r}")
+    return value
 
 
 def _parse_timeframe(value: object) -> Timeframe:

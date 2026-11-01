@@ -146,6 +146,23 @@ def test_omitted_sections_use_trading_logic_defaults(tmp_path: Path) -> None:
     )
 
 
+def test_live_is_off_unless_enabled(tmp_path: Path) -> None:
+    assert load_config(_write(tmp_path, {"timeframe": "30m", "markets": ["KRW-BTC"]})).live is False
+    assert load_config(_write(tmp_path, {"timeframe": "30m", "markets": ["KRW-BTC"], "live": True})).live is True
+
+
+@pytest.mark.parametrize("value", ["true", 1, 0, None, "false"])
+def test_live_must_be_boolean(tmp_path: Path, value: object) -> None:
+    # 실제 주문 여부라서 참·거짓으로 해석될 수 있는 다른 값을 받지 않는다
+    with pytest.raises(ConfigError, match="live must be true or false"):
+        load_config(_write(tmp_path, {"timeframe": "30m", "markets": ["KRW-BTC"], "live": value}))
+
+
+def test_repository_config_is_paper() -> None:
+    # 실거래는 이 값을 바꾸는 커밋으로만 켠다 (변경 이력을 남긴다). 그 전까지는 모의 실행이다
+    assert load_config(REPO_CONFIG).live is False
+
+
 def test_omitted_keys_inside_section_use_defaults(tmp_path: Path) -> None:
     data = {"timeframe": "30m", "markets": ["KRW-BTC"], "indicator": {"rsi": {"period": 10}}}
 

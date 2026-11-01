@@ -3,6 +3,9 @@
 from dataclasses import dataclass
 from decimal import Decimal
 
+# 업비트 주문 가능 정보의 market.state 중 주문할 수 있는 상태
+MARKET_STATE_ACTIVE = "active"
+
 
 @dataclass(frozen=True, kw_only=True)
 class Account:
