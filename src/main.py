@@ -9,11 +9,13 @@ from src.app.application import Application
 from src.app.config import ConfigError, TradingConfig, load_config
 from src.app.scheduler import CandleScheduler
 from src.connections.database import Database, DatabaseConfig
-from src.exchange.account import MARKET_STATE_ACTIVE
+from src.exchange.account import MARKET_STATE_ACTIVE, OrderChance
 from src.exchange.ticker_feed import TickerFeed
 from src.exchange.upbit_auth import UpbitCredentials
 from src.exchange.upbit_client import UpbitClient, UpbitError
 from src.repositories.market import MarketRepository
+from src.trading.live import LiveExecutor
+from src.trading.live_trader import LiveTrader
 from src.trading.market_worker import MarketWorker
 from src.trading.realtime_exit import RealtimeExit
 
@@ -45,8 +47,24 @@ async def run(
     try:
         market_ids = await register_markets(database, config.markets)
         async with UpbitClient(credentials=credentials) as upbit:
+            live = None
             if config.live:
-                await check_live_account(upbit, config.markets)
+                chances = await check_live_account(upbit, config.markets)
+                executor = LiveExecutor(
+                    upbit=upbit,
+                    database=database,
+                    exit_settings=config.exit,
+                    ask_min_totals={market: chance.ask_min_total for market, chance in chances.items()},
+                )
+                live = LiveTrader(
+                    executor=executor,
+                    upbit=upbit,
+                    database=database,
+                    chances=chances,
+                    buy_ratio=config.order.buy_ratio,
+                    exit_settings=config.exit,
+                    stochastic_entry_max=config.stochastic_entry_max,
+                )
             logger.info("trading mode: %s", "live" if config.live else "paper")
             app = Application(config_path)
             worker = MarketWorker(
@@ -58,6 +76,7 @@ async def run(
                 exit_settings=config.exit,
                 stochastic_entry_max=config.stochastic_entry_max,
                 market_ids=market_ids,
+                live=live,
             )
             scheduler = CandleScheduler(
                 timeframe=config.timeframe,
@@ -66,8 +85,8 @@ async def run(
                 job_factory=worker.candle_close_job,
             )
             app.add_service(f"scheduler:{config.timeframe}", scheduler.run)
-            # 캔들 마감 사이에는 현재가로 보유 중인 모의 포지션의 손절·익절만 판단한다 (매매 로직 5.1)
-            realtime_exit = RealtimeExit(database=database, market_ids=market_ids, submit=app.submit)
+            # 캔들 마감 사이에는 현재가로 보유 중인 포지션의 손절·익절만 판단한다 (매매 로직 5.1)
+            realtime_exit = RealtimeExit(database=database, market_ids=market_ids, submit=app.submit, live=live)
             feed = TickerFeed(markets=config.markets, on_ticker=realtime_exit.on_ticker)
             app.add_service("ticker", feed.run)
             await app.run()
@@ -75,17 +94,23 @@ async def run(
         await database.close()
 
 
-async def check_live_account(upbit: UpbitClient, markets: Sequence[str]) -> None:
-    """실거래를 시작하기 전에 키(권한·허용 IP)와 마켓별 주문 가능 여부를 확인한다. 실패하면 StartupError."""
+async def check_live_account(upbit: UpbitClient, markets: Sequence[str]) -> dict[str, OrderChance]:
+    """실거래를 시작하기 전에 키(권한·허용 IP)와 마켓별 주문 가능 여부를 확인한다. 실패하면 StartupError.
+
+    마켓별 주문 가능 정보(수수료율, 최소·최대 주문 금액)를 돌려준다.
+    """
+    chances = {}
     try:
         await upbit.get_accounts()
         for market in markets:
             chance = await upbit.get_order_chance(market)
             if chance.state != MARKET_STATE_ACTIVE:
                 raise StartupError(f"market is not tradable: {market} (state={chance.state})")
+            chances[market] = chance
     except UpbitError as error:
         # 오류 메시지에는 키가 들어가지 않는다 (UpbitClient가 쿼리·헤더를 넣지 않음)
         raise StartupError(f"upbit account check failed: {error}") from error
+    return chances
 
 
 async def register_markets(database: Database, markets: Sequence[str]) -> dict[str, int]:

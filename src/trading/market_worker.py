@@ -11,6 +11,7 @@ from src.exchange.candle import Candle
 from src.repositories.indicator_info import IndicatorInfoRepository
 from src.repositories.models import IndicatorInfo, IndicatorType
 from src.trading.indicators import Indicators, IndicatorSettings, Line, calculate
+from src.trading.live_trader import LiveTrader
 from src.trading.paper import apply_paper_decision
 from src.trading.signals import CrossState, SignalSettings, Threshold, cross, over
 
@@ -42,6 +43,7 @@ class MarketWorker:
         exit_settings: ExitSettings,
         stochastic_entry_max: float,
         market_ids: Mapping[str, int],
+        live: LiveTrader | None = None,
     ) -> None:
         self._upbit = upbit
         self._database = database
@@ -51,6 +53,8 @@ class MarketWorker:
         self._exit_settings = exit_settings
         self._stochastic_entry_max = stochastic_entry_max
         self._market_ids = market_ids
+        # 있으면 실거래로 판단하고, 없으면 모의 실행으로 기록한다 (둘 중 하나만 한다)
+        self._live = live
         self._indicator_infos = IndicatorInfoRepository()
 
     def candle_close_job(self, market: str, close: datetime) -> Job:
@@ -90,7 +94,7 @@ class MarketWorker:
             saved = [info for info in result.infos if await self._indicator_infos.save(conn, info) is not None]
             # 새로 처리한 최신 캔들에서만 한 번 판단한다 (매매 로직 3.0). 이미 처리한 마감이면 저장한 것이 없다
             trade = None
-            if saved:
+            if saved and self._live is None:
                 trade = await apply_paper_decision(
                     conn,
                     market_id=market_id,
@@ -100,6 +104,15 @@ class MarketWorker:
                     stochastic_entry_max=self._stochastic_entry_max,
                     allow_buy=len(candles) >= MIN_CANDLES_FOR_SIGNAL,
                 )
+        if saved and self._live is not None:
+            # 실거래는 거래소를 호출하므로 지표·신호를 커밋한 뒤 트랜잭션 밖에서 판단한다
+            await self._live.on_candle(
+                market,
+                market_id,
+                candle=candles[-1],
+                states={info.indicator_type: info for info in result.infos},
+                allow_buy=len(candles) >= MIN_CANDLES_FOR_SIGNAL,
+            )
         # 커밋된 뒤에 기록한다
         if result.reset:
             logger.warning("missed more than %d candles; signal states reset (market=%s)", MAX_MISSED_CANDLES, market)

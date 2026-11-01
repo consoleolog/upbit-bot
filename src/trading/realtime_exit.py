@@ -1,4 +1,4 @@
-"""실시간 손절·익절 (매매 로직 5.1). 현재가가 올 때마다 보유 중인 모의 포지션을 판단한다."""
+"""실시간 손절·익절 (매매 로직 5.1). 현재가가 올 때마다 보유 중인 포지션(모의 또는 실거래)을 판단한다."""
 
 import logging
 from collections.abc import Callable, Mapping
@@ -6,6 +6,7 @@ from collections.abc import Callable, Mapping
 from src.app.application import Job
 from src.connections.database import Database
 from src.exchange.ticker import Ticker
+from src.trading.live_trader import LiveTrader
 from src.trading.paper import apply_realtime_exit
 
 logger = logging.getLogger(__name__)
@@ -19,9 +20,16 @@ class RealtimeExit:
     """
 
     def __init__(
-        self, *, database: Database, market_ids: Mapping[str, int], submit: Callable[[str, Job], bool]
+        self,
+        *,
+        database: Database,
+        market_ids: Mapping[str, int],
+        submit: Callable[[str, Job], bool],
+        live: LiveTrader | None = None,
     ) -> None:
         self._database = database
+        # 있으면 실거래 포지션을, 없으면 모의 포지션을 판단한다
+        self._live = live
         self._market_ids = market_ids
         self._submit = submit
         self._latest: dict[str, Ticker] = {}
@@ -47,6 +55,9 @@ class RealtimeExit:
         return job
 
     async def check(self, market: str, ticker: Ticker) -> None:
+        if self._live is not None:
+            await self._live.on_ticker(market, self._market_ids[market], ticker)
+            return
         async with self._database.transaction() as conn:
             trade = await apply_realtime_exit(conn, market_id=self._market_ids[market], ticker=ticker)
         # 커밋된 뒤에 기록한다
