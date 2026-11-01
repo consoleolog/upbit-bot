@@ -160,9 +160,9 @@ def test_live_must_be_boolean(tmp_path: Path, value: object) -> None:
         load_config(_write(tmp_path, {"timeframe": "30m", "markets": ["KRW-BTC"], "live": value}))
 
 
-def test_repository_config_is_paper() -> None:
-    # 실거래는 이 값을 바꾸는 커밋으로만 켠다 (변경 이력을 남긴다). 그 전까지는 모의 실행이다
-    assert load_config(REPO_CONFIG).live is False
+def test_repository_config_is_live() -> None:
+    # 실거래는 이 값을 바꾸는 커밋으로만 켜고 끈다 (변경 이력을 남긴다). 바꿀 때 이 시험도 함께 바꾼다
+    assert load_config(REPO_CONFIG).live is True
 
 
 def test_omitted_keys_inside_section_use_defaults(tmp_path: Path) -> None:
