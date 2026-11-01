@@ -24,6 +24,10 @@ logger = logging.getLogger(__name__)
 
 # 원화 잔고를 나타내는 업비트 계좌 화폐 코드
 KRW = "KRW"
+# 매수 금액은 거래소 최소 주문 금액의 이 배수 이상이어야 한다 (매매 로직 6.1).
+# 매도도 최소 주문 금액보다 작으면 거래소가 거절하므로, 가격이 떨어져도 손절 매도를 낼 수 있게 여유를 둔다.
+# 2배면 가격이 절반 아래로 떨어지기 전까지는 전량 매도가 최소 금액에 걸리지 않는다
+MIN_BUY_MULTIPLE = Decimal(2)
 
 
 class AccountClient(Protocol):
@@ -132,12 +136,10 @@ class LiveTrader:
             balance = next((account.balance for account in accounts if account.currency == KRW), Decimal(0))
             chance = self._chances[market]
             amount = buy_amount(balance=balance, buy_ratio=self._buy_ratio, max_total=chance.max_total)
-            if amount < chance.bid_min_total:
+            minimum = min_buy_amount(chance)
+            if amount < minimum:
                 logger.info(
-                    "buy skipped: amount below minimum (market=%s, amount=%s, minimum=%s)",
-                    market,
-                    amount,
-                    chance.bid_min_total,
+                    "buy skipped: amount below minimum (market=%s, amount=%s, minimum=%s)", market, amount, minimum
                 )
                 return
             await self._executor.buy(market, market_id, amount)
@@ -154,6 +156,11 @@ def buy_amount(*, balance: Decimal, buy_ratio: Decimal, max_total: Decimal) -> D
     """매수 금액 = 원화 주문 가능 잔고 * buy_ratio / 100, 원 단위로 내림 (매매 로직 6.1). 거래소 최대 주문 금액을 넘지 않는다."""
     amount = (balance * buy_ratio / 100).to_integral_value(rounding=ROUND_DOWN)
     return min(amount, max_total)
+
+
+def min_buy_amount(chance: OrderChance) -> Decimal:
+    """매수할 수 있는 최소 금액. 매수·매도 최소 주문 금액 중 큰 값의 MIN_BUY_MULTIPLE배다."""
+    return max(chance.bid_min_total, chance.ask_min_total) * MIN_BUY_MULTIPLE
 
 
 def _held_exit_settings(position: LivePosition) -> ExitSettings:
