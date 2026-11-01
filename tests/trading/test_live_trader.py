@@ -3,6 +3,7 @@
 import asyncio
 import uuid
 from collections.abc import AsyncIterator, Mapping
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
@@ -18,7 +19,7 @@ from src.exchange.upbit_client import UpbitServerError
 from src.repositories.market import MarketRepository
 from src.repositories.models import IndicatorInfo, IndicatorType
 from src.repositories.position import PositionRepository
-from src.trading.live_trader import LiveTrader, buy_amount
+from src.trading.live_trader import LiveTrader, buy_amount, min_buy_amount
 from src.trading.reasons import Reason
 from src.trading.signals import CrossState, OverState
 
@@ -212,12 +213,21 @@ async def test_no_buy_when_buying_not_allowed(env: Env) -> None:
     assert env.accounts.calls == 0
 
 
-async def test_no_buy_below_minimum_order(env: Env) -> None:
-    env.accounts.balance = "49999"
+@pytest.mark.parametrize(("balance", "bought"), [("99999", None), ("100000", "10000")])
+async def test_buy_needs_twice_minimum_order(env: Env, balance: str, bought: str | None) -> None:
+    # 잔고의 10%가 최소 주문 금액(5,000원)의 2배 이상일 때만 산다. 가격이 떨어져도 손절 매도가 최소 금액에 걸리지 않게 한다
+    env.accounts.balance = balance
 
     await env.candle("100000000")
 
-    assert env.executor.buys == []
+    assert env.executor.buys == ([] if bought is None else [(env.market, Decimal(bought))])
+
+
+def test_min_buy_amount_uses_larger_of_bid_and_ask_minimum() -> None:
+    chance = replace(_chance("KRW-BTC"), ask_min_total=Decimal("6000"))
+
+    assert min_buy_amount(_chance("KRW-BTC")) == Decimal("10000")
+    assert min_buy_amount(chance) == Decimal("12000")
 
 
 async def test_no_buy_when_balance_unavailable(env: Env) -> None:
