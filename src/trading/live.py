@@ -245,6 +245,7 @@ class LiveExecutor:
                 cost=order.executed_funds + order.paid_fee,
                 opened_at=filled_at,
                 exit_settings=self._exit_settings,
+                first_buy_amount=order.requested_amount,
             )
             if opened is None:
                 raise InconsistentOrderError("buy filled while a position is already open")

@@ -156,7 +156,8 @@ async def test_close_in_same_candle_rejected(conn: asyncpg.Connection) -> None:
         )
 
 
-@pytest.mark.parametrize(("entry", "average"), [("0", "0"), ("100", "99.9")])
+# 추가 매수로 평단가가 첫 매수가보다 낮아질 수 있으므로, 0 이하만 막는다
+@pytest.mark.parametrize(("entry", "average"), [("0", "100"), ("100", "0")])
 async def test_invalid_entry_prices_rejected(conn: asyncpg.Connection, entry: str, average: str) -> None:
     market_id = await _market_id(conn)
 
@@ -169,3 +170,46 @@ async def test_invalid_entry_prices_rejected(conn: asyncpg.Connection, entry: st
             average_price=Decimal(average),
             exit_settings=ExitSettings(),
         )
+
+
+async def test_add_buy(conn: asyncpg.Connection) -> None:
+    position_id = await _open(conn, await _market_id(conn))
+
+    added = await repo.add_buy(conn, position_id=position_id, average_price=Decimal("96.5"), units=Decimal("1.5"))
+
+    # 추가 매수로 평단가가 첫 매수가(100)보다 낮아질 수 있다 (매매 로직 5.6)
+    assert (added.average_price, added.units, added.buy_count, added.entry_price) == (
+        Decimal("96.5"),
+        Decimal("2.5"),
+        2,
+        Decimal("100"),
+    )
+
+
+async def test_add_buy_to_closed_paper_position_fails(conn: asyncpg.Connection) -> None:
+    position_id = await _open(conn, await _market_id(conn))
+    await repo.close(
+        conn,
+        position_id=position_id,
+        exit_time=T1,
+        exit_price=Decimal("97"),
+        exit_reason=Reason.STOP_LOSS,
+        net_profit_rate=Decimal("-3"),
+    )
+
+    with pytest.raises(NotFoundError, match=str(position_id)):
+        await repo.add_buy(conn, position_id=position_id, average_price=Decimal("96"), units=Decimal("1.5"))
+
+
+@pytest.mark.parametrize("field", ["average_price", "units"])
+@pytest.mark.parametrize("value", ["NaN", "Infinity", "0", "-1"])
+async def test_unusable_paper_add_buy_not_recorded(conn: asyncpg.Connection, field: str, value: str) -> None:
+    market_id = await _market_id(conn)
+    position_id = await _open(conn, market_id)
+    before = await repo.get_open(conn, market_id)
+    add = {"average_price": Decimal("96"), "units": Decimal("1.5")}
+
+    with pytest.raises(ValueError, match=field):
+        await repo.add_buy(conn, position_id=position_id, **{**add, field: Decimal(value)})
+
+    assert await repo.get_open(conn, market_id) == before

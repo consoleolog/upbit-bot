@@ -158,6 +158,7 @@ class Env:
                 cost=Decimal(cost),
                 opened_at=T0 - timedelta(hours=1),
                 exit_settings=EXIT,
+                first_buy_amount=Decimal("5000"),
             )
 
     async def set_signal(self) -> None:
