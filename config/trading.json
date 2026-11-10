@@ -17,8 +17,8 @@
     "buy_ratio": 10.0
   },
   "exit": {
-    "take_profit_rate": 3.0,
-    "stop_loss_rate": 2.5,
-    "min_profit_rate": 1.0
+    "take_profit_rate": 1000,
+    "stop_loss_rate": 7,
+    "min_profit_rate": 0
   }
 }
