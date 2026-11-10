@@ -445,3 +445,53 @@ async def test_cancelled_without_fill_records_nothing_else(env: Env) -> None:
     assert await env.position() is None
     assert await env.signal() is CrossState.GOLDEN_CROSS
     assert not env.executor.is_halted(env.market)
+
+
+# ---------------------------------------------------------------------------
+# 추가 매수 (매매 로직 5.6)
+# ---------------------------------------------------------------------------
+
+
+async def test_add_buy_fill_accumulates_position(env: Env) -> None:
+    # 0.001개를 5,002.5원(수수료 포함)에 산 포지션이 있다
+    await env.open_position()
+    await env.set_signal()
+    env.upbit.lookups = [(OrderSide.BID, OrderState.DONE, BUY_FILL, "2.50002")]
+
+    order = await env.executor.buy(env.market, env.market_id, Decimal("5000.04"), reason=Reason.ADD)
+
+    assert order is not None and (order.state, order.reason) == (LiveOrderState.DONE, Reason.ADD)
+    position = await env.position()
+    # 수량과 비용(수수료 포함)을 더하고 매수 횟수를 늘린다. 첫 매수 금액과 매도 기준은 그대로다
+    assert (position.entry_volume, position.entry_cost, position.buy_count) == (
+        Decimal("0.002"),
+        Decimal("5002.5") + Decimal("5000.04") + Decimal("2.50002"),
+        2,
+    )
+    assert position.first_buy_amount == Decimal("5000")
+    # 체결된 매수라 신호 상태를 비운다 (매매 로직 7)
+    assert await env.signal() is None
+    assert len(env.upbit.placed) == 1
+
+
+async def test_add_buy_fill_without_position_halts(env: Env) -> None:
+    await env.set_signal()
+    env.upbit.lookups = [(OrderSide.BID, OrderState.DONE, BUY_FILL, "2.50002")]
+
+    order = await env.executor.buy(env.market, env.market_id, Decimal("5000.04"), reason=Reason.ADD)
+
+    # 추가 매수가 체결됐는데 열린 포지션이 없으면 기록과 맞지 않으므로 반영하지 않고 매매를 중단한다
+    assert env.executor.is_halted(env.market)
+    assert order is not None and await env.unfinished() == order
+    assert await env.position() is None
+    assert await env.signal() is CrossState.GOLDEN_CROSS
+
+
+async def test_entry_fill_opens_position_with_first_buy_amount(env: Env) -> None:
+    env.upbit.lookups = [(OrderSide.BID, OrderState.DONE, BUY_FILL, "2.50002")]
+
+    await env.executor.buy(env.market, env.market_id, Decimal("5000.04"))
+
+    position = await env.position()
+    # 추가 매수 금액의 기준이 되는 첫 매수 주문 금액을 남긴다 (매매 로직 6.1)
+    assert (position.buy_count, position.first_buy_amount) == (1, Decimal("5000.04"))

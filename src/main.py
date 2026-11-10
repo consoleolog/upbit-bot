@@ -61,7 +61,7 @@ async def run(
                     upbit=upbit,
                     database=database,
                     chances=chances,
-                    buy_ratio=config.order.buy_ratio,
+                    order_settings=config.order,
                     exit_settings=config.exit,
                     stochastic_entry_max=config.stochastic_entry_max,
                 )

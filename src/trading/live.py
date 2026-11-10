@@ -90,9 +90,11 @@ class LiveExecutor:
         await self._confirm(market, order, attempts=1)
         return True
 
-    async def buy(self, market: str, market_id: int, amount: Decimal) -> LiveOrder | None:
-        """원화 amount만큼 시장가로 매수한다. 주문하지 않았으면 None (매매 중단, 끝나지 않은 주문이 있음)."""
-        return await self._execute(market, market_id, OrderSide.BID, Reason.ENTRY, amount)
+    async def buy(
+        self, market: str, market_id: int, amount: Decimal, *, reason: Reason = Reason.ENTRY
+    ) -> LiveOrder | None:
+        """원화 amount만큼 시장가로 매수한다(신규 ENTRY 또는 추가 ADD). 주문하지 않았으면 None (매매 중단, 끝나지 않은 주문이 있음)."""
+        return await self._execute(market, market_id, OrderSide.BID, reason, amount)
 
     async def sell(self, market: str, market_id: int, volume: Decimal, reason: Reason) -> LiveOrder | None:
         """수량 volume을 시장가로 매도한다. 주문하지 않았으면 None."""
@@ -107,7 +109,7 @@ class LiveExecutor:
         # 보내기 전에 기록하고 커밋한다. 보내는 도중 봇이 멈춰도 identifier로 결과를 확인할 수 있다
         async with self._database.transaction() as conn:
             if side is OrderSide.BID:
-                order = await self._orders.create_buy(conn, market_id=market_id, amount=quantity)
+                order = await self._orders.create_buy(conn, market_id=market_id, amount=quantity, reason=reason)
             else:
                 order = await self._orders.create_sell(conn, market_id=market_id, volume=quantity, reason=reason)
         if order is None:
@@ -236,6 +238,18 @@ class LiveExecutor:
 
     async def _apply_fill(self, conn: asyncpg.Connection, market: str, order: LiveOrder, found: Order) -> None:
         filled_at = max(trade.created_at for trade in found.trades)
+        if order.side is OrderSide.BID and order.reason is Reason.ADD:
+            # 추가 매수는 열린 포지션에 수량과 비용(수수료 포함)을 더한다. 평단가는 가중 평균이 된다 (매매 로직 5.6)
+            current = await self._positions.get_open(conn, order.market_id)
+            if current is None:
+                raise InconsistentOrderError("add buy filled without an open position")
+            await self._positions.add_buy(
+                conn,
+                position_id=current.position_id,
+                volume=order.executed_volume,
+                cost=order.executed_funds + order.paid_fee,
+            )
+            return
         if order.side is OrderSide.BID:
             # 평단가는 매수 수수료를 포함한다 (매매 로직 5.2)
             opened = await self._positions.open(

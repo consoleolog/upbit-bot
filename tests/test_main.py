@@ -309,7 +309,7 @@ async def test_live_run_passes_live_trader_to_worker_and_realtime_exit(mocker: M
 
     # 시작할 때 받은 마켓별 수수료·최소 주문 금액으로 판단하고 주문한다
     assert trader.call_args.kwargs["chances"] == {"KRW-BTC": _chance("KRW-BTC"), "KRW-ETH": _chance("KRW-ETH")}
-    assert trader.call_args.kwargs["buy_ratio"] == LIVE.order.buy_ratio
+    assert trader.call_args.kwargs["order_settings"] is LIVE.order
     assert executor.call_args.kwargs["ask_min_totals"] == {"KRW-BTC": Decimal("5000"), "KRW-ETH": Decimal("5000")}
     assert worker.call_args.kwargs["live"] is trader.return_value
     assert worker.call_args.kwargs["order_settings"] is LIVE.order
