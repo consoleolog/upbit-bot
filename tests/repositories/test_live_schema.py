@@ -27,6 +27,7 @@ POSITION = {
     "entry_volume": Decimal("0.001"),
     "entry_cost": Decimal("5002.5"),
     "opened_at": T0,
+    "first_buy_amount": Decimal("5000"),
 }
 
 
@@ -60,8 +61,9 @@ POSITION_DEFAULTS = {
 }
 INSERT_POSITION = """
     INSERT INTO position (market_id, status, take_profit_rate, stop_loss_rate, min_profit_rate, entry_volume,
-                          entry_cost, sold_volume, sold_proceeds, opened_at, closed_at, exit_reason)
-    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                          entry_cost, sold_volume, sold_proceeds, opened_at, closed_at, exit_reason,
+                          first_buy_amount)
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
     RETURNING *
 """
 
@@ -100,6 +102,7 @@ async def _position(conn: asyncpg.Connection, market_id: int, **values: Any) -> 
         v["opened_at"],
         v["closed_at"],
         v["exit_reason"],
+        v["first_buy_amount"],
     )
 
 
@@ -193,6 +196,7 @@ async def test_identifier_is_unique(conn: asyncpg.Connection) -> None:
         {"state": "unknown"},
         # 매수는 신규 매수, 매도는 매도 사유만
         {"reason": "STOP_LOSS"},
+        {**SELL, "requested_amount": None, "reason": "ADD"},
         {**SELL, "requested_amount": None, "reason": "ENTRY"},
         {**SELL, "requested_amount": None, "reason": "MANUAL"},
         # 매수는 금액, 매도는 수량만 있어야 한다
@@ -232,8 +236,8 @@ async def test_position_defaults(conn: asyncpg.Connection) -> None:
     position = await conn.fetchrow(
         """
         INSERT INTO position (market_id, take_profit_rate, stop_loss_rate, min_profit_rate,
-                              entry_volume, entry_cost, opened_at)
-        VALUES ($1, 1.5, 3, 0.3, 0.001, 5002.5, $2)
+                              entry_volume, entry_cost, opened_at, first_buy_amount)
+        VALUES ($1, 1.5, 3, 0.3, 0.001, 5002.5, $2, 5000)
         RETURNING *
         """,
         await _market_id(conn),
@@ -272,6 +276,7 @@ async def test_one_open_position_per_market(conn: asyncpg.Connection) -> None:
     "values",
     [
         {"status": "HOLD"},
+        {"first_buy_amount": Decimal("0")},
         {"take_profit_rate": Decimal("0")},
         {"stop_loss_rate": Decimal("0")},
         {"min_profit_rate": Decimal("-0.1")},
@@ -295,3 +300,17 @@ async def test_invalid_position_rejected(conn: asyncpg.Connection, values: dict[
 
     with pytest.raises(asyncpg.CheckViolationError):
         await _position(conn, market_id, **values)
+
+
+async def test_add_buy_order_accepted(conn: asyncpg.Connection) -> None:
+    order = await _order(conn, await _market_id(conn), reason="ADD")
+
+    assert (order["side"], order["reason"]) == ("bid", "ADD")
+
+
+async def test_position_buy_count_must_be_positive(conn: asyncpg.Connection) -> None:
+    position = await _position(conn, await _market_id(conn))
+
+    assert position["buy_count"] == 1
+    with pytest.raises(asyncpg.CheckViolationError):
+        await conn.execute("UPDATE position SET buy_count = 0 WHERE position_id = $1", position["position_id"])

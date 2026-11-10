@@ -60,8 +60,12 @@ CREATE TABLE paper_position (
     exit_reason     varchar(20),
     net_profit_rate numeric,
     created_at      timestamptz NOT NULL DEFAULT now(),
+    -- 매수 횟수(첫 매수 포함)와 누적 매수 금액(첫 매수 금액을 1로 본 비율). 추가 매수의 평단가 계산에 쓴다 (매매 로직 5.6)
+    buy_count       int         NOT NULL DEFAULT 1,
+    units           numeric     NOT NULL DEFAULT 1,
     CHECK (status IN ('OPEN', 'CLOSED')),
-    CHECK (entry_price > 0 AND average_price >= entry_price),
+    -- 추가 매수로 평단가가 첫 매수가보다 낮아질 수 있다
+    CONSTRAINT paper_position_check CHECK (entry_price > 0 AND average_price > 0),
     CHECK (take_profit_rate > 0 AND stop_loss_rate > 0 AND min_profit_rate >= 0),
     CHECK (exit_reason IN ('STOP_LOSS', 'TAKE_PROFIT', 'OVERBOUGHT_EXIT', 'DEAD_CROSS_EXIT')),
     -- 열린 포지션은 매도 정보가 모두 없고, 닫힌 포지션은 모두 있다
@@ -71,7 +75,8 @@ CREATE TABLE paper_position (
             AND net_profit_rate IS NOT NULL)
     ),
     -- 매도는 매수한 캔들보다 뒤의 캔들에서만 한다
-    CHECK (exit_time > entry_time)
+    CHECK (exit_time > entry_time),
+    CONSTRAINT paper_position_buys_check CHECK (buy_count >= 1 AND units >= 1)
 );
 
 -- 마켓당 열린 포지션은 하나 (매매 로직 5.1). 같은 마켓을 두 번 사는 것을 DB에서 막는다
@@ -98,9 +103,9 @@ CREATE TABLE orders (
     created_at       timestamptz NOT NULL DEFAULT now(),
     CHECK (side IN ('bid', 'ask')),
     CHECK (state IN ('pending', 'wait', 'done', 'cancel', 'failed')),
-    -- 매수는 신규 매수뿐이고, 매도는 손절·익절·신호 매도다
-    CHECK (
-        (side = 'bid' AND reason = 'ENTRY')
+    -- 매수는 신규 매수·추가 매수이고, 매도는 손절·익절·신호 매도다
+    CONSTRAINT orders_check CHECK (
+        (side = 'bid' AND reason IN ('ENTRY', 'ADD'))
         OR (side = 'ask' AND reason IN ('STOP_LOSS', 'TAKE_PROFIT', 'OVERBOUGHT_EXIT', 'DEAD_CROSS_EXIT'))
     ),
     -- 매수는 주문 금액만, 매도는 주문 수량만 있다. 체결은 주문한 만큼을 넘을 수 없다.
@@ -137,6 +142,9 @@ CREATE TABLE position (
     opened_at        timestamptz NOT NULL,
     closed_at        timestamptz,
     exit_reason      varchar(20),
+    -- 매수 횟수(첫 매수 포함)와 첫 매수 주문 금액. 추가 매수 금액과 횟수 한도에 쓴다 (매매 로직 5.6, 6.1)
+    buy_count        int         NOT NULL DEFAULT 1,
+    first_buy_amount numeric     NOT NULL,
     CHECK (status IN ('OPEN', 'CLOSED')),
     CHECK (take_profit_rate > 0 AND stop_loss_rate > 0 AND min_profit_rate >= 0),
     CHECK (entry_volume > 0 AND entry_cost > 0),
@@ -147,7 +155,8 @@ CREATE TABLE position (
     CHECK (
         (status = 'OPEN' AND closed_at IS NULL AND exit_reason IS NULL)
         OR (status = 'CLOSED' AND closed_at IS NOT NULL AND closed_at >= opened_at AND exit_reason IS NOT NULL)
-    )
+    ),
+    CONSTRAINT position_buys_check CHECK (buy_count >= 1 AND first_buy_amount > 0)
 );
 
 -- 마켓당 열린 포지션은 하나 (매매 로직 5.1). 같은 마켓을 두 번 사는 것을 DB에서 막는다

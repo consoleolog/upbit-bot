@@ -46,6 +46,7 @@ async def test_live_report(conn: asyncpg.Connection) -> None:
         cost=Decimal("200100"),
         opened_at=T0,
         exit_settings=ExitSettings(),
+        first_buy_amount=Decimal("200000"),
     )
     assert opened is not None
     await positions.add_sell(conn, position_id=opened.position_id, volume=Decimal("0.0005"), proceeds=Decimal("50000"))
@@ -57,6 +58,7 @@ async def test_live_report(conn: asyncpg.Connection) -> None:
         cost=Decimal("10005"),
         opened_at=T0,
         exit_settings=ExitSettings(),
+        first_buy_amount=Decimal("10000"),
     )
     assert closed is not None
     await positions.add_sell(conn, position_id=closed.position_id, volume=Decimal("0.0001"), proceeds=Decimal("10155"))

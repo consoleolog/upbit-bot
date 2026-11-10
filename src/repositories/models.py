@@ -108,6 +108,9 @@ class PaperPosition:
     exit_price: Decimal | None
     exit_reason: Reason | None
     net_profit_rate: Decimal | None
+    # 매수 횟수(첫 매수 포함)와 누적 매수 금액(첫 매수 금액을 1로 본 비율) (매매 로직 5.6)
+    buy_count: int
+    units: Decimal
 
     @classmethod
     def from_record(cls, row: asyncpg.Record) -> Self:
@@ -125,6 +128,8 @@ class PaperPosition:
             exit_price=row["exit_price"],
             exit_reason=None if row["exit_reason"] is None else Reason(row["exit_reason"]),
             net_profit_rate=row["net_profit_rate"],
+            buy_count=row["buy_count"],
+            units=row["units"],
         )
 
 
@@ -196,6 +201,9 @@ class LivePosition:
     opened_at: datetime
     closed_at: datetime | None
     exit_reason: Reason | None
+    # 매수 횟수(첫 매수 포함)와 첫 매수 주문 금액 (매매 로직 5.6, 6.1)
+    buy_count: int
+    first_buy_amount: Decimal
 
     @property
     def average_price(self) -> Decimal:
@@ -222,4 +230,6 @@ class LivePosition:
             opened_at=row["opened_at"],
             closed_at=row["closed_at"],
             exit_reason=None if row["exit_reason"] is None else Reason(row["exit_reason"]),
+            buy_count=row["buy_count"],
+            first_buy_amount=row["first_buy_amount"],
         )

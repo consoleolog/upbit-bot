@@ -207,3 +207,20 @@ async def test_unusable_result_not_recorded(conn: asyncpg.Connection, field: str
         )
 
     assert await repo.get_unfinished(conn, order.market_id) == order
+
+
+async def test_create_add_buy(conn: asyncpg.Connection) -> None:
+    order = await repo.create_buy(conn, market_id=await _market_id(conn), amount=Decimal("7500"), reason=Reason.ADD)
+
+    assert order is not None
+    assert (order.side, order.reason, order.requested_amount) == (OrderSide.BID, Reason.ADD, Decimal("7500"))
+
+
+@pytest.mark.parametrize("reason", [Reason.STOP_LOSS, Reason.OVERBOUGHT_EXIT])
+async def test_buy_with_sell_reason_rejected(conn: asyncpg.Connection, reason: Reason) -> None:
+    market_id = await _market_id(conn)
+
+    with pytest.raises(ValueError, match="ENTRY or ADD"):
+        await repo.create_buy(conn, market_id=market_id, amount=Decimal("5000"), reason=reason)
+
+    assert await repo.get_unfinished(conn, market_id) is None

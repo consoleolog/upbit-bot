@@ -6,6 +6,7 @@ import asyncpg
 from src.app.config import ExitSettings
 from src.repositories.errors import NotFoundError
 from src.repositories.models import PaperPosition
+from src.repositories.values import check_decimal
 from src.trading.reasons import Reason
 
 
@@ -44,6 +45,30 @@ class PaperPositionRepository:
             exit_settings.min_profit_rate,
         )
         return None if row is None else PaperPosition.from_record(row)
+
+    async def add_buy(
+        self, conn: asyncpg.Connection, *, position_id: int, average_price: Decimal, units: Decimal
+    ) -> PaperPosition:
+        """모의 추가 매수를 기록한다. average_price는 추가 매수를 반영한 새 평단가, units는 이번 매수 금액(첫 매수 = 1)이다.
+
+        열린 모의 포지션이 아니면 NotFoundError.
+        """
+        check_decimal("average_price", average_price, positive=True)
+        check_decimal("units", units, positive=True)
+        row = await conn.fetchrow(
+            """
+            UPDATE paper_position
+            SET average_price = $2, units = units + $3, buy_count = buy_count + 1
+            WHERE position_id = $1 AND status = 'OPEN'
+            RETURNING *
+            """,
+            position_id,
+            average_price,
+            units,
+        )
+        if row is None:
+            raise NotFoundError(f"open paper position not found: {position_id}")
+        return PaperPosition.from_record(row)
 
     async def close(
         self,

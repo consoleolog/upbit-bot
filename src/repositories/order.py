@@ -18,13 +18,17 @@ _INSERT = """
 
 
 class OrderRepository:
-    async def create_buy(self, conn: asyncpg.Connection, *, market_id: int, amount: Decimal) -> LiveOrder | None:
-        """원화 amount의 신규 매수 주문을 거래소에 보내기 전에 기록한다.
+    async def create_buy(
+        self, conn: asyncpg.Connection, *, market_id: int, amount: Decimal, reason: Reason = Reason.ENTRY
+    ) -> LiveOrder | None:
+        """원화 amount의 매수 주문(신규 ENTRY 또는 추가 ADD)을 거래소에 보내기 전에 기록한다.
 
         마켓에 끝나지 않은 주문이 있으면 기록하지 않고 None. 그때는 주문을 보내지 않는다.
         """
+        if reason not in (Reason.ENTRY, Reason.ADD):
+            raise ValueError(f"buy reason must be ENTRY or ADD: {reason}")
         check_decimal("amount", amount, positive=True)
-        row = await conn.fetchrow(_INSERT, market_id, OrderSide.BID, Reason.ENTRY, amount, None)
+        row = await conn.fetchrow(_INSERT, market_id, OrderSide.BID, reason, amount, None)
         return None if row is None else LiveOrder.from_record(row)
 
     async def create_sell(

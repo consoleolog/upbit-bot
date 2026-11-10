@@ -30,7 +30,13 @@ async def _market_id(conn: asyncpg.Connection) -> int:
 async def _open(conn: asyncpg.Connection, market_id: int) -> LivePosition:
     # 0.001개를 4997.5원에 사고 수수료 2.49875원을 냈다
     position = await repo.open(
-        conn, market_id=market_id, volume=Decimal("0.001"), cost=Decimal("4999.99875"), opened_at=T0, exit_settings=EXIT
+        conn,
+        market_id=market_id,
+        volume=Decimal("0.001"),
+        cost=Decimal("4999.99875"),
+        opened_at=T0,
+        exit_settings=EXIT,
+        first_buy_amount=Decimal("5000"),
     )
     assert position is not None
     return position
@@ -56,6 +62,8 @@ async def test_open_and_get_open(conn: asyncpg.Connection) -> None:
         opened_at=T0,
         closed_at=None,
         exit_reason=None,
+        buy_count=1,
+        first_buy_amount=Decimal("5000"),
     )
     assert await repo.get_open(conn, market_id) == position
     # 평단가는 매수 수수료를 포함한다 (매매 로직 5.2)
@@ -70,7 +78,13 @@ async def test_second_open_position_in_market_not_recorded(conn: asyncpg.Connect
     # 예외 없이 None으로 알려 트랜잭션을 계속 쓸 수 있다
     assert (
         await repo.open(
-            conn, market_id=market_id, volume=Decimal("1"), cost=Decimal("1"), opened_at=T1, exit_settings=EXIT
+            conn,
+            market_id=market_id,
+            volume=Decimal("1"),
+            cost=Decimal("1"),
+            opened_at=T1,
+            exit_settings=EXIT,
+            first_buy_amount=Decimal("5000"),
         )
         is None
     )
@@ -150,7 +164,14 @@ async def test_unusable_entry_not_recorded(conn: asyncpg.Connection, field: str,
 
     # NaN과 Infinity는 DB의 "> 0" 제약을 통과하므로 기록하기 전에 막는다
     with pytest.raises(ValueError, match=field):
-        await repo.open(conn, market_id=market_id, opened_at=T0, exit_settings=EXIT, **{**entry, field: Decimal(value)})
+        await repo.open(
+            conn,
+            market_id=market_id,
+            opened_at=T0,
+            exit_settings=EXIT,
+            first_buy_amount=Decimal("5000"),
+            **{**entry, field: Decimal(value)},
+        )
 
     assert await repo.get_open(conn, market_id) is None
 
@@ -183,8 +204,64 @@ async def test_naive_times_rejected(conn: asyncpg.Connection) -> None:
 
     with pytest.raises(ValueError, match="opened_at"):
         await repo.open(
-            conn, market_id=market_id, volume=Decimal("1"), cost=Decimal("1"), opened_at=naive, exit_settings=EXIT
+            conn,
+            market_id=market_id,
+            volume=Decimal("1"),
+            cost=Decimal("1"),
+            opened_at=naive,
+            exit_settings=EXIT,
+            first_buy_amount=Decimal("5000"),
         )
     position = await _open(conn, market_id)
     with pytest.raises(ValueError, match="closed_at"):
         await repo.close(conn, position_id=position.position_id, closed_at=naive, exit_reason=Reason.STOP_LOSS)
+
+
+async def test_add_buy_accumulates_with_fee_weighted_average(conn: asyncpg.Connection) -> None:
+    position = await _open(conn, await _market_id(conn))
+
+    # 0.0015개를 7,500원에 더 사고 수수료 3.75원을 냈다
+    added = await repo.add_buy(
+        conn, position_id=position.position_id, volume=Decimal("0.0015"), cost=Decimal("7503.75")
+    )
+
+    assert (added.entry_volume, added.entry_cost, added.buy_count) == (Decimal("0.0025"), Decimal("12503.74875"), 2)
+    # 평단가는 수수료를 포함한 수량 가중 평균이고, 첫 매수 금액과 매도 기준은 그대로다 (매매 로직 2.3, 5.6)
+    assert added.average_price == Decimal("12503.74875") / Decimal("0.0025")
+    assert (added.first_buy_amount, added.stop_loss_rate) == (position.first_buy_amount, position.stop_loss_rate)
+
+
+async def test_add_buy_to_closed_position_fails(conn: asyncpg.Connection) -> None:
+    position = await _open(conn, await _market_id(conn))
+    await repo.close(conn, position_id=position.position_id, closed_at=T1, exit_reason=Reason.STOP_LOSS)
+
+    with pytest.raises(NotFoundError, match=str(position.position_id)):
+        await repo.add_buy(conn, position_id=position.position_id, volume=Decimal("1"), cost=Decimal("1"))
+
+
+@pytest.mark.parametrize("field", ["volume", "cost"])
+@pytest.mark.parametrize("value", ["NaN", "Infinity", "0", "-1"])
+async def test_unusable_add_buy_not_recorded(conn: asyncpg.Connection, field: str, value: str) -> None:
+    position = await _open(conn, await _market_id(conn))
+    add = {"volume": Decimal("0.001"), "cost": Decimal("5000")}
+
+    with pytest.raises(ValueError, match=field):
+        await repo.add_buy(conn, position_id=position.position_id, **{**add, field: Decimal(value)})
+
+    assert await repo.get_open(conn, position.market_id) == position
+
+
+@pytest.mark.parametrize("value", ["NaN", "0", "-1"])
+async def test_unusable_first_buy_amount_not_recorded(conn: asyncpg.Connection, value: str) -> None:
+    market_id = await _market_id(conn)
+
+    with pytest.raises(ValueError, match="first_buy_amount"):
+        await repo.open(
+            conn,
+            market_id=market_id,
+            volume=Decimal("0.001"),
+            cost=Decimal("5000"),
+            opened_at=T0,
+            exit_settings=EXIT,
+            first_buy_amount=Decimal(value),
+        )

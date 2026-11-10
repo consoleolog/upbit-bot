@@ -147,6 +147,7 @@ class Env:
                 cost=Decimal(cost),
                 opened_at=T0,
                 exit_settings=HELD_EXIT,
+                first_buy_amount=Decimal("10000"),
             )
 
     async def candle(self, close: str, *, allow_buy: bool = True, start: datetime = T0) -> None:
