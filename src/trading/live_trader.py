@@ -9,7 +9,7 @@ from collections.abc import Mapping
 from decimal import ROUND_DOWN, Decimal
 from typing import Protocol
 
-from src.app.config import ExitSettings
+from src.app.config import ExitSettings, OrderSettings
 from src.connections.database import Database
 from src.exchange.account import Account, OrderChance
 from src.exchange.candle import Candle
@@ -19,6 +19,7 @@ from src.repositories.models import IndicatorInfo, IndicatorType, LivePosition
 from src.repositories.position import PositionRepository
 from src.trading.decision import Action, Decision, Holding, decide
 from src.trading.live import LiveExecutor
+from src.trading.reasons import Reason
 
 logger = logging.getLogger(__name__)
 
@@ -44,7 +45,7 @@ class LiveTrader:
         upbit: AccountClient,
         database: Database,
         chances: Mapping[str, OrderChance],
-        buy_ratio: Decimal,
+        order_settings: OrderSettings,
         exit_settings: ExitSettings,
         stochastic_entry_max: float,
     ) -> None:
@@ -53,7 +54,8 @@ class LiveTrader:
         self._database = database
         # 마켓별 수수료율과 최소·최대 주문 금액 (시작할 때 거래소에서 받은 값, 매매 로직 5.2, 6.1)
         self._chances = chances
-        self._buy_ratio = buy_ratio
+        # 매수 비율과 추가 매수 배수·횟수 한도 (매매 로직 5.6, 6.1)
+        self._order = order_settings
         # 새로 매수할 포지션의 매도 기준. 보유 중인 포지션은 매수할 때 저장한 기준을 쓴다 (매매 로직 2.3)
         self._exit_settings = exit_settings
         self._stochastic_entry_max = stochastic_entry_max
@@ -82,11 +84,19 @@ class LiveTrader:
             exit_settings=self._exit_settings if position is None else _held_exit_settings(position),
             stochastic_entry_max=self._stochastic_entry_max,
             sell_fee_rate=self._chances[market].ask_fee,
+            can_add=position is not None and position.buy_count - 1 < self._order.max_add_buys,
         )
         if decision is None:
             return
         if decision.action is Action.BUY:
-            if allow_buy:
+            if not allow_buy:
+                return
+            if decision.reason is Reason.ADD:
+                if position is None:
+                    # decide는 보유 중일 때만 추가 매수를 돌려준다. 여기에 오면 판단 로직의 버그다
+                    raise RuntimeError(f"add buy decided without an open position (market={market})")
+                await self._add_buy(market, market_id, position)
+            else:
                 await self._buy(market, market_id)
             return
         await self._sell(market, market_id, position, decision)
@@ -135,7 +145,7 @@ class LiveTrader:
                 return
             balance = next((account.balance for account in accounts if account.currency == KRW), Decimal(0))
             chance = self._chances[market]
-            amount = buy_amount(balance=balance, buy_ratio=self._buy_ratio, max_total=chance.max_total)
+            amount = buy_amount(balance=balance, buy_ratio=self._order.buy_ratio, max_total=chance.max_total)
             minimum = min_buy_amount(chance)
             if amount < minimum:
                 logger.info(
@@ -143,6 +153,37 @@ class LiveTrader:
                 )
                 return
             await self._executor.buy(market, market_id, amount)
+
+    async def _add_buy(self, market: str, market_id: int, position: LivePosition) -> None:
+        """첫 매수 주문 금액 * add_buy_multiple만큼 추가 매수한다 (매매 로직 5.6, 6.1).
+
+        잔고가 그 금액(수수료 포함)보다 적거나, 최소·최대 주문 금액을 벗어나면 사지 않는다. 금액을 줄여서 사지 않는다.
+        """
+        async with self._buy_lock:
+            chance = self._chances[market]
+            amount = (position.first_buy_amount * self._order.add_buy_multiple).to_integral_value(rounding=ROUND_DOWN)
+            minimum = min_buy_amount(chance)
+            if not minimum <= amount <= chance.max_total:
+                logger.info(
+                    "add buy skipped: amount out of range (market=%s, amount=%s, minimum=%s, maximum=%s)",
+                    market,
+                    amount,
+                    minimum,
+                    chance.max_total,
+                )
+                return
+            try:
+                accounts = await self._upbit.get_accounts()
+            except UpbitError as error:
+                logger.warning("add buy skipped: balance unavailable (market=%s): %s", market, error)
+                return
+            balance = next((account.balance for account in accounts if account.currency == KRW), Decimal(0))
+            if balance < amount * (1 + chance.bid_fee):
+                logger.info(
+                    "add buy skipped: balance too low (market=%s, amount=%s, balance=%s)", market, amount, balance
+                )
+                return
+            await self._executor.buy(market, market_id, amount, reason=Reason.ADD)
 
     async def _sell(self, market: str, market_id: int, position: LivePosition | None, decision: Decision) -> None:
         if position is None:

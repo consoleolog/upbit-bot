@@ -10,7 +10,7 @@ from decimal import Decimal
 import pytest
 import pytest_asyncio
 
-from src.app.config import ExitSettings
+from src.app.config import ExitSettings, OrderSettings
 from src.connections.database import Database
 from src.exchange.account import Account, OrderChance
 from src.exchange.candle import Candle
@@ -84,6 +84,7 @@ class FakeExecutor:
         self.unfinished: set[str] = set()
         self.resolved: list[str] = []
         self.buys: list[tuple[str, Decimal]] = []
+        self.buy_reasons: list[Reason] = []
         self.sells: list[tuple[str, Decimal, Reason]] = []
         self.on_buy: asyncio.Event | None = None
 
@@ -94,8 +95,9 @@ class FakeExecutor:
         self.resolved.append(market)
         return market in self.unfinished
 
-    async def buy(self, market: str, market_id: int, amount: Decimal) -> None:
+    async def buy(self, market: str, market_id: int, amount: Decimal, *, reason: Reason = Reason.ENTRY) -> None:
         self.buys.append((market, amount))
+        self.buy_reasons.append(reason)
         if self.on_buy is not None:
             await self.on_buy.wait()
 
@@ -124,6 +126,8 @@ class Env:
         self.executor = FakeExecutor()
         self.accounts = FakeAccounts()
         self.chances = {market: _chance(market) for market in markets}
+        # 매수 비율 10%, 추가 매수는 첫 매수 금액의 1.5배로 최대 2번 (매매 로직 5.6)
+        self.order = OrderSettings(buy_ratio=Decimal("10"), add_buy_multiple=Decimal("1.5"), max_add_buys=2)
         self.trader = self.make_trader()
 
     def make_trader(self) -> LiveTrader:
@@ -132,12 +136,12 @@ class Env:
             upbit=self.accounts,
             database=self.database,
             chances=self.chances,
-            buy_ratio=Decimal("10"),
+            order_settings=self.order,
             exit_settings=CONFIG_EXIT,
             stochastic_entry_max=50.0,
         )
 
-    async def hold(self, *, volume: str = "0.001", cost: str = "100000") -> None:
+    async def hold(self, *, volume: str = "0.001", cost: str = "100000", buys: int = 1) -> None:
         """평단가 100,000,000원짜리 포지션을 매수할 때의 기준(HELD_EXIT)으로 연다."""
         async with self.database.transaction() as conn:
             await PositionRepository().open(
@@ -149,6 +153,8 @@ class Env:
                 exit_settings=HELD_EXIT,
                 first_buy_amount=Decimal("10000"),
             )
+            # 추가 매수를 한 포지션으로 만든다
+            await conn.execute("UPDATE position SET buy_count = $2 WHERE market_id = $1", self.market_id, buys)
 
     async def candle(self, close: str, *, allow_buy: bool = True, start: datetime = T0) -> None:
         await self.trader.on_candle(
@@ -271,12 +277,13 @@ async def test_unfinished_order_is_resolved_and_not_judged(env: Env) -> None:
     assert (env.executor.buys, env.executor.sells) == ([], [])
 
 
-async def test_holding_no_second_buy(env: Env) -> None:
+async def test_holding_never_buys_as_new_entry(env: Env) -> None:
     await env.hold()
 
     await env.candle("100000000")
 
-    assert env.executor.buys == []
+    # 보유 중의 매수는 추가 매수뿐이다. 포지션을 새로 열지 않는다
+    assert env.executor.buy_reasons == [Reason.ADD]
 
 
 async def test_candle_stop_loss_sells_all_with_held_settings(env: Env) -> None:
@@ -343,3 +350,97 @@ async def test_buys_in_different_markets_run_one_at_a_time(env: Env) -> None:
     await asyncio.wait_for(asyncio.gather(first, second), timeout=5)
     assert env.accounts.calls == 2
     assert [market for market, _ in env.executor.buys] == [env.market, other]
+
+
+# ---------------------------------------------------------------------------
+# 추가 매수 (매매 로직 5.6)
+# ---------------------------------------------------------------------------
+
+
+async def test_add_buy_is_first_amount_times_multiple(env: Env) -> None:
+    # 첫 매수 10,000원인 포지션을 들고 있는데 매수 신호가 다시 났다. 손절·익절 범위 안이다
+    await env.hold()
+
+    await env.candle("99000000")
+
+    assert env.executor.buys == [(env.market, Decimal("15000"))]
+    assert env.executor.buy_reasons == [Reason.ADD]
+
+
+async def test_no_add_buy_after_limit(env: Env) -> None:
+    await env.hold(buys=3)
+
+    await env.candle("99000000")
+
+    # 첫 매수 1번 + 추가 매수 2번을 했으면 더 사지 않는다
+    assert env.executor.buys == []
+    assert env.accounts.calls == 0
+
+
+async def test_no_add_buy_when_disabled(env: Env) -> None:
+    env.order = OrderSettings(buy_ratio=Decimal("10"), max_add_buys=0)
+    env.trader = env.make_trader()
+    await env.hold()
+
+    await env.candle("99000000")
+
+    assert env.executor.buys == []
+
+
+async def test_no_add_buy_when_balance_too_low(env: Env) -> None:
+    await env.hold()
+    # 15,000원 + 수수료 7.5원보다 1원 모자란다
+    env.accounts.balance = "15006.5"
+
+    await env.candle("99000000")
+
+    # 금액을 줄여서 사지 않는다
+    assert env.executor.buys == []
+
+
+async def test_add_buy_with_exact_balance(env: Env) -> None:
+    await env.hold()
+    env.accounts.balance = "15007.5"
+
+    await env.candle("99000000")
+
+    assert env.executor.buys == [(env.market, Decimal("15000"))]
+
+
+async def test_no_add_buy_when_balance_unavailable(env: Env) -> None:
+    await env.hold()
+    env.accounts.error = UpbitServerError("GET /v1/accounts failed (503)", status=503)
+
+    await env.candle("99000000")
+
+    assert env.executor.buys == []
+
+
+async def test_no_add_buy_with_short_window(env: Env) -> None:
+    await env.hold()
+
+    await env.candle("99000000", allow_buy=False)
+
+    assert env.executor.buys == []
+
+
+async def test_no_add_buy_below_minimum(env: Env) -> None:
+    # 첫 매수 금액이 6,000원이면 추가 매수는 9,000원으로 최소 금액(10,000원)보다 작다
+    await env.hold()
+    async with env.database.transaction() as conn:
+        await conn.execute("UPDATE position SET first_buy_amount = 6000 WHERE market_id = $1", env.market_id)
+
+    await env.candle("99000000")
+
+    assert env.executor.buys == []
+    assert env.accounts.calls == 0
+
+
+async def test_stop_loss_comes_before_add_buy(env: Env) -> None:
+    await env.hold()
+
+    # 매수 신호가 나도 손절 기준(-3%) 아래면 먼저 판다
+    await env.candle("96000000")
+
+    assert env.executor.buys == []
+    assert env.executor.sells == [(env.market, Decimal("0.001"), Reason.STOP_LOSS)]
