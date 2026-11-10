@@ -168,9 +168,12 @@ def _check_exit_reason_matches_profit_range(candles: list[Candle], positions: li
             assert rate <= -p.stop_loss_rate
         elif p.exit_reason is Reason.TAKE_PROFIT:
             assert rate >= p.take_profit_rate
-        else:
-            # 신호 매도는 순수익일 때만 하고, 손절·익절 범위 밖이다
+        elif p.exit_reason is Reason.DEAD_CROSS_EXIT:
+            # 데드크로스 매도는 순수익이 최소 순수익률을 넘을 때만 하고, 손절·익절 범위 밖이다
             assert p.min_profit_rate < rate < p.take_profit_rate
+        else:
+            # 과매수 매도는 수익과 상관없이 하지만, 손절·익절에 먼저 걸리지 않은 경우다
+            assert -p.stop_loss_rate < rate < p.take_profit_rate
 
 
 def _check_stop_loss_and_take_profit_are_not_late(candles: list[Candle], positions: list[PaperPosition]) -> None:

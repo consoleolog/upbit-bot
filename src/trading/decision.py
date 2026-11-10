@@ -67,13 +67,14 @@ def decide(
         return Decision(action=Action.SELL, reason=Reason.STOP_LOSS)
     if rate >= exit_settings.take_profit_rate:
         return Decision(action=Action.SELL, reason=Reason.TAKE_PROFIT)
-    # 신호 매도는 순수익일 때만 한다. 손실 상태의 매도는 손절로만 한다 (매매 로직 5.5)
-    if rate <= exit_settings.min_profit_rate:
-        return None
+    # 과매수 매도는 수익과 상관없이 한다. 오른 뒤 꺾이기 전에 빠져나온다 (매매 로직 5.5)
     if _over(states, IndicatorType.STOCHASTIC, OverState.OVER_BOUGHT) and _over(
         states, IndicatorType.RSI, OverState.OVER_BOUGHT
     ):
         return Decision(action=Action.SELL, reason=Reason.OVERBOUGHT_EXIT)
+    # 데드크로스 매도는 순수익이 최소 순수익률을 넘을 때만 한다 (매매 로직 5.5)
+    if rate <= exit_settings.min_profit_rate:
+        return None
     if _cross(states, IndicatorType.STOCHASTIC, CrossState.DEAD_CROSS) and _cross(
         states, IndicatorType.RSI, CrossState.DEAD_CROSS
     ):

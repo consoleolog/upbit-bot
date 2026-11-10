@@ -195,19 +195,26 @@ def _dead_cross_states() -> dict[IndicatorType, IndicatorInfo]:
     return {t: _with(_info(t), cross=dead) for t in (IndicatorType.RSI, IndicatorType.STOCHASTIC)}
 
 
-@pytest.mark.parametrize(
-    ("states", "reason"),
-    [(_overbought_states(), Reason.OVERBOUGHT_EXIT), (_dead_cross_states(), Reason.DEAD_CROSS_EXIT)],
-)
-def test_signal_sell_above_min_profit(states: dict[IndicatorType, IndicatorInfo], reason: Reason) -> None:
-    assert _decide(states, HOLDING, "100.6") == Decision(action=Action.SELL, reason=reason)
+@pytest.mark.parametrize("close", ["100.6", "100.5", "100", "98"])
+def test_overbought_exit_regardless_of_profit(close: str) -> None:
+    # 과매수 매도는 손실 중이어도 한다 (매매 로직 5.5). 손절 기준(-3%) 안쪽이다
+    assert _decide(_overbought_states(), HOLDING, close) == Decision(action=Action.SELL, reason=Reason.OVERBOUGHT_EXIT)
+
+
+def test_dead_cross_exit_above_min_profit() -> None:
+    assert _decide(_dead_cross_states(), HOLDING, "100.6") == Decision(
+        action=Action.SELL, reason=Reason.DEAD_CROSS_EXIT
+    )
 
 
 @pytest.mark.parametrize("close", ["100.5", "100", "98"])
-def test_no_signal_sell_at_or_below_min_profit(close: str) -> None:
-    # 순수익률이 최소 순수익률(0.5%)을 넘어야 한다. 손실 상태의 매도는 손절로만 한다
-    assert _decide(_overbought_states(), HOLDING, close) is None
+def test_no_dead_cross_exit_at_or_below_min_profit(close: str) -> None:
+    # 데드크로스 매도는 순수익률이 최소 순수익률(0.5%)을 넘어야 한다
     assert _decide(_dead_cross_states(), HOLDING, close) is None
+
+
+def test_stop_loss_comes_before_overbought_exit() -> None:
+    assert _decide(_overbought_states(), HOLDING, "96.9") == Decision(action=Action.SELL, reason=Reason.STOP_LOSS)
 
 
 def test_overbought_exit_comes_before_dead_cross_exit() -> None:
