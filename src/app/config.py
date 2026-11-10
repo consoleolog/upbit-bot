@@ -36,9 +36,15 @@ class Timeframe(StrEnum):
 
 @dataclass(frozen=True, kw_only=True)
 class OrderSettings:
-    """주문 금액 (매매 로직 6.1). 매수 금액 = 원화 주문 가능 잔고 * buy_ratio / 100."""
+    """주문 금액 (매매 로직 6.1). 매수 금액 = 원화 주문 가능 잔고 * buy_ratio / 100.
+
+    보유 중 매수 신호가 다시 나면 첫 매수 금액 * add_buy_multiple만큼 추가 매수하고, 최대 max_add_buys번까지 한다
+    (매매 로직 5.6). max_add_buys가 0이면 추가 매수하지 않는다.
+    """
 
     buy_ratio: Decimal = Decimal("10.0")
+    add_buy_multiple: Decimal = Decimal("1.5")
+    max_add_buys: int = 0
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -77,7 +83,7 @@ def load_config(path: Path) -> TradingConfig:
     root = _object(raw, "config", {"timeframe", "markets", "indicator", "threshold", "order", "exit", "live"})
     indicator = _object(root.get("indicator", {}), "indicator", {"ema", "macd_signal", "rsi", "stochastic"})
     threshold = _object(root.get("threshold", {}), "threshold", {"rsi", "stochastic", "stochastic_entry_max"})
-    order = _object(root.get("order", {}), "order", {"buy_ratio"})
+    order = _object(root.get("order", {}), "order", {"buy_ratio", "add_buy_multiple", "max_add_buys"})
     exit_ = _object(root.get("exit", {}), "exit", {"take_profit_rate", "stop_loss_rate", "min_profit_rate"})
     # 기간·기준의 범위와 순서는 각 설정 클래스가 만들 때 검증한다
     try:
@@ -197,7 +203,13 @@ def _parse_order(section: Mapping[str, object]) -> OrderSettings:
     # 수수료를 더해도 잔고를 넘지 않도록 100보다 작아야 한다 (매매 로직 2.2)
     if not 0 < buy_ratio < 100:
         raise ConfigError(f"order.buy_ratio must be greater than 0 and less than 100: {buy_ratio}")
-    return OrderSettings(buy_ratio=buy_ratio)
+    add_buy_multiple = _decimal(section, "add_buy_multiple", OrderSettings.add_buy_multiple)
+    if add_buy_multiple <= 0:
+        raise ConfigError(f"order.add_buy_multiple must be positive: {add_buy_multiple}")
+    max_add_buys = _integer(section, "max_add_buys", "order.max_add_buys", OrderSettings.max_add_buys)
+    if max_add_buys < 0:
+        raise ConfigError(f"order.max_add_buys must not be negative: {max_add_buys}")
+    return OrderSettings(buy_ratio=buy_ratio, add_buy_multiple=add_buy_multiple, max_add_buys=max_add_buys)
 
 
 def _parse_exit(section: Mapping[str, object]) -> ExitSettings:

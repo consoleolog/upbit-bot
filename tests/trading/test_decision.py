@@ -304,3 +304,41 @@ def test_naive_candle_time_rejected() -> None:
 def test_invalid_fee_rejected(fee: Decimal) -> None:
     with pytest.raises(ValueError, match="fee rate"):
         _decide({}, HOLDING, "100", fee)
+
+
+# ---------------------------------------------------------------------------
+# 추가 매수 (매매 로직 5.6)
+# ---------------------------------------------------------------------------
+
+
+def _decide_holding(states: dict[IndicatorType, IndicatorInfo], close: str, *, can_add: bool) -> Decision | None:
+    return decide(
+        states=states,
+        holding=HOLDING,
+        candle_time=T0,
+        close=Decimal(close),
+        exit_settings=EXIT,
+        stochastic_entry_max=50.0,
+        sell_fee_rate=NO_FEE,
+        can_add=can_add,
+    )
+
+
+def test_add_buy_with_same_conditions_as_entry() -> None:
+    assert _decide_holding(_entry_states(), "99", can_add=True) == Decision(action=Action.BUY, reason=Reason.ADD)
+
+
+def test_no_add_buy_without_permission() -> None:
+    # 횟수 한도에 닿았거나 추가 매수를 쓰지 않으면 호출하는 쪽이 can_add=False를 넘긴다
+    assert _decide_holding(_entry_states(), "99", can_add=False) is None
+
+
+@pytest.mark.parametrize("name", ["rsi over sold", "stochastic golden", "macd long golden", "stochastic %K <= max"])
+def test_add_buy_needs_all_entry_conditions(name: str) -> None:
+    assert _decide_holding(_without_condition(name), "99", can_add=True) is None
+
+
+def test_stop_loss_comes_before_add_buy() -> None:
+    assert _decide_holding(_entry_states(), "96.9", can_add=True) == Decision(
+        action=Action.SELL, reason=Reason.STOP_LOSS
+    )

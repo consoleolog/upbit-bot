@@ -101,7 +101,7 @@ FULL = {
         "stochastic": {"over_sold": 20, "over_bought": 80},
         "stochastic_entry_max": 45,
     },
-    "order": {"buy_ratio": 0.1},
+    "order": {"buy_ratio": 0.1, "add_buy_multiple": 2, "max_add_buys": 3},
     "exit": {"take_profit_rate": 2, "stop_loss_rate": 4.5, "min_profit_rate": 0},
 }
 
@@ -125,7 +125,7 @@ def test_load_all_sections(tmp_path: Path) -> None:
     )
     assert config.stochastic_entry_max == 45
     # 비율·수익률은 Decimal로, JSON에 적힌 값 그대로 읽는다 (0.1이 0.1000000000000000055…가 되지 않음)
-    assert config.order == OrderSettings(buy_ratio=Decimal("0.1"))
+    assert config.order == OrderSettings(buy_ratio=Decimal("0.1"), add_buy_multiple=Decimal("2"), max_add_buys=3)
     assert str(config.order.buy_ratio) == "0.1"
     assert config.exit == ExitSettings(
         take_profit_rate=Decimal("2"), stop_loss_rate=Decimal("4.5"), min_profit_rate=Decimal("0")
@@ -139,6 +139,8 @@ def test_omitted_sections_use_trading_logic_defaults(tmp_path: Path) -> None:
     assert config.signal == SignalSettings()
     assert config.stochastic_entry_max == 50
     assert config.order.buy_ratio == Decimal("10")
+    # 추가 매수는 켜지 않으면 하지 않는다 (매매 로직 5.6)
+    assert (config.order.add_buy_multiple, config.order.max_add_buys) == (Decimal("1.5"), 0)
     assert (config.exit.take_profit_rate, config.exit.stop_loss_rate, config.exit.min_profit_rate) == (
         Decimal("1.5"),
         Decimal("3.0"),
@@ -211,6 +213,11 @@ def _with(path: tuple[str, ...], value: object) -> dict[str, object]:
         (("threshold", "stochastic_entry_max"), 101, "between 0 and 100"),
         (("order", "buy_ratio"), 0, "buy_ratio"),
         (("order", "buy_ratio"), 100, "buy_ratio"),
+        (("order", "add_buy_multiple"), 0, "add_buy_multiple must be positive"),
+        (("order", "add_buy_multiple"), float("inf"), "finite number"),
+        (("order", "max_add_buys"), -1, "max_add_buys must not be negative"),
+        (("order", "max_add_buys"), 1.5, "integer"),
+        (("order", "max_add_buys"), True, "integer"),
         (("exit", "take_profit_rate"), 0, "must be positive"),
         (("exit", "stop_loss_rate"), -3, "must be positive"),
         (("exit", "min_profit_rate"), -0.1, "must not be negative"),

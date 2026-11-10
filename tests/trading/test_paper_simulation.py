@@ -13,7 +13,7 @@ from itertools import pairwise
 
 import pytest
 
-from src.app.config import ExitSettings, Timeframe
+from src.app.config import ExitSettings, OrderSettings, Timeframe
 from src.connections.database import Database
 from src.exchange.candle import Candle
 from src.repositories.market import MarketRepository
@@ -214,6 +214,7 @@ async def test_paper_simulation_follows_trading_rules(database: Database) -> Non
         signal_settings=SignalSettings(),
         exit_settings=EXIT,
         stochastic_entry_max=ENTRY_MAX,
+        order_settings=OrderSettings(),
         market_ids={symbol: market.market_id},
     )
     try:
