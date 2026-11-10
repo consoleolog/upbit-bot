@@ -7,13 +7,14 @@ from decimal import Decimal
 
 import asyncpg
 
-from src.app.config import ExitSettings
+from src.app.config import ExitSettings, OrderSettings
 from src.exchange.candle import Candle
 from src.exchange.ticker import Ticker
 from src.repositories.indicator_info import IndicatorInfoRepository
 from src.repositories.models import IndicatorInfo, IndicatorType, PaperPosition
 from src.repositories.paper_position import PaperPositionRepository
 from src.trading.decision import Action, Decision, Holding, decide, net_profit_rate
+from src.trading.reasons import Reason
 
 # 업비트 KRW 마켓 수수료(0.05%). 실제 주문을 만들 때 거래소에서 받은 값으로 바꾼다
 PAPER_FEE_RATE = Decimal("0.0005")
@@ -34,11 +35,13 @@ async def apply_paper_decision(
     exit_settings: ExitSettings,
     stochastic_entry_max: float,
     allow_buy: bool,
+    order_settings: OrderSettings,
 ) -> PaperTrade | None:
     """candle(방금 마감된 캔들)에서 매매를 판단해 모의 매수·매도를 기록한다. 매매하지 않으면 None.
 
     매수·매도를 기록하면 이 마켓의 신호 상태를 모두 비운다 (매매 로직 7).
     allow_buy가 False면(계산 구간이 짧은 캔들, 매매 로직 3.0) 매수하지 않는다. 손절·익절·신호 매도는 판단한다.
+    보유 중 매수 신호가 다시 나면 order_settings의 배수·횟수 한도 안에서 추가 매수한다 (매매 로직 5.6).
     exit_settings는 새로 매수할 포지션의 매도 기준이다. 보유 중인 포지션은 매수할 때 저장한 기준을 쓴다 (매매 로직 2.3).
     호출하는 쪽의 트랜잭션 안에서 실행해, 신호 상태 저장과 함께 커밋되게 한다.
     """
@@ -52,12 +55,27 @@ async def apply_paper_decision(
         exit_settings=exit_settings if current is None else _held_exit_settings(current),
         stochastic_entry_max=stochastic_entry_max,
         sell_fee_rate=PAPER_FEE_RATE,
+        can_add=current is not None and current.buy_count - 1 < order_settings.max_add_buys,
     )
     if decision is None:
         return None
     if decision.action is Action.BUY:
         if not allow_buy:
             return None
+        if decision.reason is Reason.ADD:
+            if current is None:
+                # decide는 보유 중일 때만 추가 매수를 돌려준다. 여기에 오면 판단 로직의 버그다
+                raise RuntimeError(f"add buy decided without an open paper position (market_id={market_id})")
+            added = await positions.add_buy(
+                conn,
+                position_id=current.position_id,
+                average_price=paper_average_after_add(
+                    current.average_price, current.units, order_settings.add_buy_multiple, candle.close
+                ),
+                units=order_settings.add_buy_multiple,
+            )
+            await IndicatorInfoRepository().clear_signal_states(conn, market_id)
+            return PaperTrade(decision=decision, position=added)
         opened = await positions.open(
             conn,
             market_id=market_id,
@@ -100,6 +118,17 @@ async def apply_realtime_exit(conn: asyncpg.Connection, *, market_id: int, ticke
     if decision is None:
         return None
     return await _sell(conn, current, decision, time=ticker.traded_at, price=ticker.price)
+
+
+def paper_average_after_add(average_price: Decimal, units: Decimal, add_units: Decimal, price: Decimal) -> Decimal:
+    """추가 매수 뒤의 모의 평단가 (수수료 포함, 매수 금액 가중).
+
+    지금까지 첫 매수 금액의 units배를 샀고, 이번에 add_units배를 price에 산다고 본다.
+    평단가 = 매수 비용 합계 / 매수 수량 합계이고, 비용 = 금액 * (1 + 수수료율), 수량 = 금액 / 체결가다.
+    """
+    cost = (units + add_units) * (1 + PAPER_FEE_RATE)
+    volume = units * (1 + PAPER_FEE_RATE) / average_price + add_units / price
+    return cost / volume
 
 
 def _held_exit_settings(position: PaperPosition) -> ExitSettings:

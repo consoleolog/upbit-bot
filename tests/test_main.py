@@ -312,6 +312,7 @@ async def test_live_run_passes_live_trader_to_worker_and_realtime_exit(mocker: M
     assert trader.call_args.kwargs["buy_ratio"] == LIVE.order.buy_ratio
     assert executor.call_args.kwargs["ask_min_totals"] == {"KRW-BTC": Decimal("5000"), "KRW-ETH": Decimal("5000")}
     assert worker.call_args.kwargs["live"] is trader.return_value
+    assert worker.call_args.kwargs["order_settings"] is LIVE.order
     assert realtime_exit.call_args.kwargs["live"] is trader.return_value
 
 

@@ -8,7 +8,7 @@ from unittest.mock import MagicMock
 import pytest
 from pytest_mock import MockerFixture
 
-from src.app.config import ExitSettings, Timeframe
+from src.app.config import ExitSettings, OrderSettings, Timeframe
 from src.connections.database import Database
 from src.exchange.candle import Candle
 from src.repositories.indicator_info import IndicatorInfoRepository
@@ -351,6 +351,7 @@ def _worker(upbit: FakeUpbit, database: Database, market_ids: dict[str, int]) ->
         signal_settings=SignalSettings(),
         exit_settings=ExitSettings(),
         stochastic_entry_max=50.0,
+        order_settings=OrderSettings(),
         market_ids=market_ids,
     )
 
@@ -571,6 +572,7 @@ async def test_live_judges_after_commit_instead_of_paper(
         signal_settings=SignalSettings(),
         exit_settings=ExitSettings(),
         stochastic_entry_max=50.0,
+        order_settings=OrderSettings(),
         market_ids={symbol: market_id},
         live=live,  # type: ignore[arg-type]
     )
@@ -598,6 +600,7 @@ async def test_live_does_not_buy_with_short_window(database: Database, market: t
         signal_settings=SignalSettings(),
         exit_settings=ExitSettings(),
         stochastic_entry_max=50.0,
+        order_settings=OrderSettings(),
         market_ids={symbol: market_id},
         live=live,  # type: ignore[arg-type]
     )

@@ -77,6 +77,7 @@ async def run(
                 stochastic_entry_max=config.stochastic_entry_max,
                 market_ids=market_ids,
                 live=live,
+                order_settings=config.order,
             )
             scheduler = CandleScheduler(
                 timeframe=config.timeframe,

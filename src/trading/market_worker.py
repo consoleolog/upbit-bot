@@ -5,7 +5,7 @@ from datetime import datetime
 from typing import Protocol
 
 from src.app.application import Job
-from src.app.config import ExitSettings, Timeframe
+from src.app.config import ExitSettings, OrderSettings, Timeframe
 from src.connections.database import Database
 from src.exchange.candle import Candle
 from src.repositories.indicator_info import IndicatorInfoRepository
@@ -43,6 +43,7 @@ class MarketWorker:
         exit_settings: ExitSettings,
         stochastic_entry_max: float,
         market_ids: Mapping[str, int],
+        order_settings: OrderSettings,
         live: LiveTrader | None = None,
     ) -> None:
         self._upbit = upbit
@@ -55,6 +56,8 @@ class MarketWorker:
         self._market_ids = market_ids
         # 있으면 실거래로 판단하고, 없으면 모의 실행으로 기록한다 (둘 중 하나만 한다)
         self._live = live
+        # 모의 실행의 추가 매수 배수·횟수 한도 (매매 로직 5.6)
+        self._order_settings = order_settings
         self._indicator_infos = IndicatorInfoRepository()
 
     def candle_close_job(self, market: str, close: datetime) -> Job:
@@ -103,6 +106,7 @@ class MarketWorker:
                     exit_settings=self._exit_settings,
                     stochastic_entry_max=self._stochastic_entry_max,
                     allow_buy=len(candles) >= MIN_CANDLES_FOR_SIGNAL,
+                    order_settings=self._order_settings,
                 )
         if saved and self._live is not None:
             # 실거래는 거래소를 호출하므로 지표·신호를 커밋한 뒤 트랜잭션 밖에서 판단한다
@@ -129,13 +133,15 @@ class MarketWorker:
         if trade is not None:
             position = trade.position
             logger.info(
-                "paper %s (market=%s, reason=%s, candle=%s, price=%s, average_price=%s, net_profit_rate=%s)",
+                "paper %s (market=%s, reason=%s, candle=%s, price=%s, average_price=%s, buy_count=%s, "
+                "net_profit_rate=%s)",
                 trade.decision.action,
                 market,
                 trade.decision.reason,
                 candles[-1].start_kst.isoformat(),
                 candles[-1].close,
                 position.average_price,
+                position.buy_count,
                 position.net_profit_rate,
             )
 

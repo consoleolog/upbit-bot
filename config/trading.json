@@ -14,7 +14,9 @@
     "stochastic_entry_max": 50
   },
   "order": {
-    "buy_ratio": 10.0
+    "buy_ratio": 10.0,
+    "add_buy_multiple": 1.5,
+    "max_add_buys": 2
   },
   "exit": {
     "take_profit_rate": 1000,

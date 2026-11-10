@@ -44,11 +44,12 @@ def decide(
     exit_settings: ExitSettings,
     stochastic_entry_max: float,
     sell_fee_rate: Decimal,
+    can_add: bool = False,
 ) -> Decision | None:
     """판단 순서대로 처음 충족한 매수·매도를 돌려준다. 해당하는 것이 없으면 None (매매 로직 5.1).
 
     판단할 캔들은 candle_time(시작 시각)이고 close는 그 캔들의 종가다.
-    보유 중이면 손절 → 익절 → 과매수 매도 → 데드크로스 매도, 미보유면 신규 매수만 본다.
+    보유 중이면 손절 → 익절 → 과매수 매도 → 데드크로스 매도 → (can_add면) 추가 매수, 미보유면 신규 매수만 본다.
     신호 상태가 빠져 있거나 다른 캔들 기준이면 그 상태가 필요한 조건은 충족하지 않은 것으로 본다
     (판단할 수 없으면 사지도 팔지도 않음). 손절·익절은 신호 상태가 필요 없으므로 그대로 판단한다.
     """
@@ -73,12 +74,15 @@ def decide(
     ):
         return Decision(action=Action.SELL, reason=Reason.OVERBOUGHT_EXIT)
     # 데드크로스 매도는 순수익이 최소 순수익률을 넘을 때만 한다 (매매 로직 5.5)
-    if rate <= exit_settings.min_profit_rate:
-        return None
-    if _cross(states, IndicatorType.STOCHASTIC, CrossState.DEAD_CROSS) and _cross(
-        states, IndicatorType.RSI, CrossState.DEAD_CROSS
+    if (
+        rate > exit_settings.min_profit_rate
+        and _cross(states, IndicatorType.STOCHASTIC, CrossState.DEAD_CROSS)
+        and _cross(states, IndicatorType.RSI, CrossState.DEAD_CROSS)
     ):
         return Decision(action=Action.SELL, reason=Reason.DEAD_CROSS_EXIT)
+    # 팔지 않으면, 신규 매수와 같은 조건으로 추가 매수한다. 횟수 한도는 호출하는 쪽이 can_add로 알려 준다 (매매 로직 5.6)
+    if can_add and _entry(states, stochastic_entry_max):
+        return Decision(action=Action.BUY, reason=Reason.ADD)
     return None
 
 

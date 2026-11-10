@@ -6,21 +6,29 @@ from decimal import Decimal
 import asyncpg
 import pytest
 
-from src.app.config import ExitSettings
+from src.app.config import ExitSettings, OrderSettings
 from src.exchange.candle import Candle
 from src.exchange.ticker import Ticker
 from src.repositories.indicator_info import IndicatorInfoRepository
 from src.repositories.market import MarketRepository
 from src.repositories.models import IndicatorInfo, IndicatorType, PositionStatus
 from src.repositories.paper_position import PaperPositionRepository
-from src.trading.decision import Action, Reason
-from src.trading.paper import PAPER_FEE_RATE, PaperTrade, apply_paper_decision, apply_realtime_exit
+from src.trading.decision import Action, Decision, Reason
+from src.trading.paper import (
+    PAPER_FEE_RATE,
+    PaperTrade,
+    apply_paper_decision,
+    apply_realtime_exit,
+    paper_average_after_add,
+)
 from src.trading.signals import CrossState, OverState
 
 pytestmark = pytest.mark.integration
 
 T0 = datetime(2026, 1, 1, tzinfo=UTC)
 T1 = T0 + timedelta(minutes=30)
+# 추가 매수를 하지 않는 기존 설정 (매매 로직 5.6의 max_add_buys = 0)
+NO_ADD = OrderSettings(max_add_buys=0)
 infos = IndicatorInfoRepository()
 positions = PaperPositionRepository()
 
@@ -64,6 +72,7 @@ async def _apply(
     states: dict[IndicatorType, IndicatorInfo],
     *,
     allow_buy: bool = True,
+    order_settings: OrderSettings = NO_ADD,
 ) -> PaperTrade | None:
     return await apply_paper_decision(
         conn,
@@ -73,6 +82,7 @@ async def _apply(
         exit_settings=ExitSettings(),
         stochastic_entry_max=50.0,
         allow_buy=allow_buy,
+        order_settings=order_settings,
     )
 
 
@@ -191,6 +201,7 @@ async def test_buy_stores_exit_settings_at_entry(conn: asyncpg.Connection) -> No
         exit_settings=settings,
         stochastic_entry_max=50.0,
         allow_buy=True,
+        order_settings=NO_ADD,
     )
 
     assert trade is not None
@@ -234,6 +245,7 @@ async def test_holding_uses_exit_settings_from_entry(
         exit_settings=ExitSettings(stop_loss_rate=Decimal(current_stop_loss)),
         stochastic_entry_max=50.0,
         allow_buy=True,
+        order_settings=NO_ADD,
     )
 
     if sells:
@@ -328,3 +340,88 @@ async def test_realtime_ignores_ticker_before_entry(conn: asyncpg.Connection, tr
 
     assert await apply_realtime_exit(conn, market_id=market_id, ticker=_tick("50", traded_at)) is None
     assert await positions.get_open(conn, market_id) is not None
+
+
+# 추가 매수 (매매 로직 5.6): 첫 매수 금액의 1.5배, 최대 2번
+ADD_TWO = OrderSettings(add_buy_multiple=Decimal("1.5"), max_add_buys=2)
+
+
+def test_paper_average_after_add_is_cost_weighted_with_fee() -> None:
+    # 100원에 1만큼 샀고(평단가 100.05), 90원에 1.5만큼 더 산다
+    average = paper_average_after_add(Decimal("100.05"), Decimal("1"), Decimal("1.5"), Decimal("90"))
+
+    cost = Decimal("2.5") * Decimal("1.0005")
+    volume = Decimal("1.0005") / Decimal("100.05") + Decimal("1.5") / Decimal("90")
+    assert average == cost / volume
+    # 금액 기준으로 샀으므로 수량 기준 평균 2.5 / (1/100 + 1.5/90) = 93.75보다 수수료만큼 높다
+    assert Decimal("93.75") < average < Decimal("93.8")
+
+
+async def test_add_buy_when_buy_signal_repeats_while_holding(conn: asyncpg.Connection) -> None:
+    market_id = await _market_id(conn)
+    await _apply(conn, market_id, _candle(T0, "100"), await _save_states(conn, market_id, T0, entry=True))
+    t2 = T1 + timedelta(minutes=30)
+
+    trade = await _apply(
+        conn, market_id, _candle(t2, "98"), await _save_states(conn, market_id, t2, entry=True), order_settings=ADD_TWO
+    )
+
+    assert trade is not None and trade.decision == Decision(action=Action.BUY, reason=Reason.ADD)
+    position = trade.position
+    assert (position.buy_count, position.units, position.entry_price, position.status) == (
+        2,
+        Decimal("2.5"),
+        Decimal("100"),
+        PositionStatus.OPEN,
+    )
+    assert position.average_price == paper_average_after_add(
+        Decimal("100.05"), Decimal("1"), Decimal("1.5"), Decimal("98")
+    )
+    # 추가 매수도 체결된 매수라 신호 상태를 비운다 (매매 로직 7)
+    assert _all_cleared(await infos.list_by_market(conn, market_id))
+
+
+async def test_add_buy_stops_at_limit(conn: asyncpg.Connection) -> None:
+    market_id = await _market_id(conn)
+    times = [T0 + timedelta(minutes=30 * i) for i in range(4)]
+    reasons = []
+    for i, time in enumerate(times):
+        trade = await _apply(
+            conn,
+            market_id,
+            _candle(time, str(100 - i)),
+            await _save_states(conn, market_id, time, entry=True),
+            order_settings=ADD_TWO,
+        )
+        reasons.append(None if trade is None else trade.decision.reason)
+
+    # 첫 매수 1번 + 추가 매수 2번까지만 한다
+    assert reasons == [Reason.ENTRY, Reason.ADD, Reason.ADD, None]
+    position = await PaperPositionRepository().get_open(conn, market_id)
+    assert position is not None and (position.buy_count, position.units) == (3, Decimal("4.0"))
+
+
+async def test_no_add_buy_when_disabled_or_window_short(conn: asyncpg.Connection) -> None:
+    market_id = await _market_id(conn)
+    await _apply(conn, market_id, _candle(T0, "100"), await _save_states(conn, market_id, T0, entry=True))
+    t2 = T1 + timedelta(minutes=30)
+    states = await _save_states(conn, market_id, t2, entry=True)
+
+    assert await _apply(conn, market_id, _candle(t2, "98"), states) is None
+    # 계산 구간이 짧은 캔들에서는 추가 매수도 하지 않는다 (매매 로직 3.0)
+    assert await _apply(conn, market_id, _candle(t2, "98"), states, allow_buy=False, order_settings=ADD_TWO) is None
+    position = await PaperPositionRepository().get_open(conn, market_id)
+    assert position is not None and position.buy_count == 1
+
+
+async def test_sell_comes_before_add_buy(conn: asyncpg.Connection) -> None:
+    market_id = await _market_id(conn)
+    await _apply(conn, market_id, _candle(T0, "100"), await _save_states(conn, market_id, T0, entry=True))
+    t2 = T1 + timedelta(minutes=30)
+
+    # 손절 기준(-3%) 아래에서 매수 신호가 나도 먼저 손절한다
+    trade = await _apply(
+        conn, market_id, _candle(t2, "96"), await _save_states(conn, market_id, t2, entry=True), order_settings=ADD_TWO
+    )
+
+    assert trade is not None and trade.decision.reason is Reason.STOP_LOSS
