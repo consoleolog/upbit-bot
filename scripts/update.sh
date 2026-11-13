@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# 서버에서 dev 브랜치의 최신 코드로 봇을 업데이트하고 재시작한다.
+# 서버에서 지금 체크아웃된 브랜치(dev 또는 prod)의 최신 코드로 봇을 업데이트하고 재시작한다.
+# dev는 모의 실행 확인용, prod는 운영(실거래) 브랜치다.
 #
 # 사용법: ./scripts/update.sh
 #         ./scripts/update.sh --schema-applied   (바뀐 스키마를 기존 DB에 직접 적용한 뒤)
@@ -13,7 +14,8 @@
 
 set -euo pipefail
 
-BRANCH="dev"
+# 서버가 받을 수 있는 브랜치. 다른 브랜치(기능 브랜치 등)로 운영 서버를 돌리지 않게 막는다
+ALLOWED_BRANCHES="dev prod"
 SCHEMA_APPLIED=false
 case "${1:-}" in
     "") ;;
@@ -48,7 +50,10 @@ if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
 fi
 
 current_branch="$(git rev-parse --abbrev-ref HEAD)"
-[ "$current_branch" = "$BRANCH" ] || fail "현재 브랜치가 $BRANCH가 아닙니다 ($current_branch)."
+case " $ALLOWED_BRANCHES " in
+    *" $current_branch "*) BRANCH="$current_branch" ;;
+    *) fail "현재 브랜치가 dev 또는 prod가 아닙니다 ($current_branch)." ;;
+esac
 
 timeout "$FETCH_TIMEOUT" git fetch --quiet origin "$BRANCH" || fail "git fetch가 실패했거나 ${FETCH_TIMEOUT}초 안에 끝나지 않았습니다."
 before="$(git rev-parse HEAD)"
