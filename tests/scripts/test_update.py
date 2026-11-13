@@ -208,7 +208,23 @@ def test_wrong_branch_stops(server: Server) -> None:
     result = server.run()
 
     assert result.returncode == 1
-    assert "브랜치가 dev가 아닙니다" in result.stderr
+    assert "브랜치가 dev 또는 prod가 아닙니다" in result.stderr
+
+
+def test_prod_branch_updates_from_origin_prod(server: Server) -> None:
+    # 운영 서버는 prod 브랜치를 받는다. dev의 변경은 prod에 머지되기 전에는 받지 않는다
+    _git(server.origin, "checkout", "-q", "-b", "prod")
+    _git(server.repo, "fetch", "-q", "origin", "prod")
+    _git(server.repo, "checkout", "-q", "-b", "prod", "origin/prod")
+    server.push("config/trading.json", '{"live": true}\n', "chore: 실거래 켜기")
+    _git(server.origin, "checkout", "-q", "dev")
+    server.push("src/app.py", "print(2)\n", "feat: 아직 dev에만 있는 기능")
+
+    result = server.run()
+
+    assert result.returncode == 0, result.stderr
+    assert server.head() == "chore: 실거래 켜기"
+    assert "compose up -d" in server.docker_calls()
 
 
 def test_missing_env_file_stops(server: Server) -> None:

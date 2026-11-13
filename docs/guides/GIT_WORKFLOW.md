@@ -8,13 +8,13 @@ GitHub Issue 기반의 개발 프로세스를 따르며, 모든 변경사항은 
 
 | 브랜치         | 역할                             |
 |-------------|--------------------------------|
-| `main`      | 운영(배포) 환경, 항상 안정적인 상태 유지       |
+| `prod`      | 운영(실거래) 환경, 항상 안정적인 상태 유지. 서버는 이 브랜치를 받는다 |
 | `dev`       | 개발 통합 브랜치, 모든 기능 개발의 기준점       |
 | `feature/*` | 기능 개발, `dev`에서 분기              |
-| `hotfix/*`  | 운영 중 발생한 긴급 버그 수정, `main`에서 분기 |
+| `hotfix/*`  | 운영 중 발생한 긴급 버그 수정, `prod`에서 분기 |
 
 ```
-main ◄──────────────── hotfix/main-<n>
+prod ◄──────────────── hotfix/prod-<n>
  ▲                            │
  │                            ▼ (dev에도 반영)
 dev ◄─── feature/dev-<n>    dev
@@ -80,28 +80,32 @@ PR은 브랜치의 **커밋 1개**를 그대로 반영하므로, 커밋의 heade
 
 ---
 
-## dev → main 배포
+## dev → prod 배포
 
-`dev`의 개발이 완료되어 운영에 반영할 때는 **PR + Rebase Merge + Git Tag** 방식을 사용합니다.
+`dev`의 개발이 완료되어 운영에 반영할 때는 **PR + Merge commit + Git Tag** 방식을 사용합니다.
+
+- 실거래 설정(`config/trading.json`의 `"live": true`)은 `prod`에만 둡니다. `dev`는 항상 모의 실행입니다.
+- `prod`에만 있는 커밋이 있으므로 Rebase Merge를 쓰지 않습니다. Rebase Merge는 커밋을 새로 만들어 `dev`와 `prod`의 이력을 갈라지게 하고, 다음 배포에서 같은 변경이 다시 적용되거나 충돌합니다.
 
 ### 배포 흐름
 
-1. **PR 생성**: `dev` → `main` 으로 PR을 생성합니다.
+1. **PR 생성**: `dev` → `prod` 로 PR을 생성합니다.
 2. **리뷰 및 승인**: 배포 범위와 변경사항을 최종 확인합니다.
-3. **Rebase Merge**: GitHub UI에서 **"Rebase and merge"** 로 병합합니다.
+3. **Merge commit**: GitHub UI에서 **"Create a merge commit"** 으로 병합합니다.
 4. **Git Tag**: 배포 시점을 태그로 기록합니다.
+5. **서버 반영**: 서버(`prod` 체크아웃)에서 `./scripts/update.sh`를 실행합니다.
 
 ### Pull Request
 
 - **PR 제목**: `release: v<MAJOR.MINOR.PATCH>` (예: `release: v1.2.0`)
 - **body**: 이번 배포에 포함된 변경사항 요약
 
-### Rebase Merge
+### Merge commit
 
-Rebase and merge 방식으로 병합하면 `dev`의 커밋들이 `main` 위에 그대로 재적용되어 **선형 히스토리**를 유지합니다.
+Merge commit 방식은 `dev`의 커밋을 그대로 두고 `prod`에 병합 커밋 하나를 더합니다. `dev`와 `prod`가 같은 커밋을 공유하므로 다음 배포도 충돌 없이 이어집니다.
 
 1. PR 페이지 하단 Merge 버튼 옆 드롭다운 클릭
-2. **"Rebase and merge"** 선택
+2. **"Create a merge commit"** 선택
 3. Merge 실행
 
 ### Git Tag 관리
@@ -132,23 +136,23 @@ git checkout v1.2.0
 
 ## Hotfix 흐름
 
-운영(`main`)에서 긴급 버그가 발생한 경우 아래 절차를 따릅니다.
+운영(`prod`)에서 긴급 버그가 발생한 경우 아래 절차를 따릅니다.
 
 1. **Issue 생성**: 긴급 버그를 Issue로 등록합니다.
-2. **Issue Assign**: 본인에게 Assign하면 `main`에서 브랜치가 자동 생성됩니다.
+2. **Issue Assign**: 본인에게 Assign하면 `prod`에서 브랜치가 자동 생성됩니다.
 3. **작업 및 커밋**: 수정 사항을 커밋합니다.
-4. **PR → `main`**: `main`을 base로 PR을 생성하고 Rebase Merge합니다.
-5. **`dev`에 반영**: `main`의 변경사항을 `dev`에도 머지하여 동기화합니다.
+4. **PR → `prod`**: `prod`를 base로 PR을 생성하고 Rebase Merge합니다.
+5. **`dev`에 반영**: hotfix 커밋을 `dev`에 cherry-pick합니다. `prod`를 통째로 머지하면 `prod`에만 있는 실거래 설정(`"live": true`)까지 `dev`로 넘어오므로 머지하지 않습니다.
 
 ### 브랜치 생성
 
-- **명명 규칙**: `hotfix/main-<이슈번호>`
-- **예시**: `hotfix/main-7`
+- **명명 규칙**: `hotfix/prod-<이슈번호>`
+- **예시**: `hotfix/prod-7`
 
 ```bash
-git checkout main
-git pull origin main
-git checkout -b hotfix/main-7
+git checkout prod
+git pull origin prod
+git checkout -b hotfix/prod-7
 ```
 
 ### Pull Request
@@ -161,12 +165,12 @@ PR은 브랜치의 **커밋 1개**를 그대로 반영하므로, 커밋의 heade
 
 ### dev 동기화
 
-`main` 머지 완료 후 반드시 `dev`에도 반영합니다.
+`prod` 머지 완료 후 반드시 hotfix 커밋을 `dev`에도 반영합니다. 실거래 설정이 넘어오지 않도록 머지 대신 cherry-pick합니다.
 
 ```bash
 git checkout dev
 git pull origin dev
-git merge --no-ff main
+git cherry-pick <hotfix 커밋>
 git push origin dev
 ```
 
