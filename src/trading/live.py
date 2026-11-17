@@ -14,11 +14,12 @@ from typing import Protocol
 import asyncpg
 
 from src.app.config import ExitSettings
+from src.app.notifier import Notifier
 from src.connections.database import Database
 from src.exchange.order import Order, OrderSide, OrderState
 from src.exchange.upbit_client import UpbitError, UpbitUnknownResultError
 from src.repositories.indicator_info import IndicatorInfoRepository
-from src.repositories.models import LiveOrder, LiveOrderState
+from src.repositories.models import LiveOrder, LiveOrderState, LivePosition
 from src.repositories.order import OrderRepository
 from src.repositories.position import PositionRepository
 from src.trading.reasons import Reason
@@ -58,6 +59,7 @@ class LiveExecutor:
         database: Database,
         exit_settings: ExitSettings,
         ask_min_totals: Mapping[str, Decimal],
+        notifier: Notifier,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
     ) -> None:
@@ -67,6 +69,8 @@ class LiveExecutor:
         self._exit_settings = exit_settings
         # 마켓별 최소 매도 금액. 매도하고 남은 수량이 이보다 작으면 더 팔 수 없으므로 포지션을 닫는다
         self._ask_min_totals = ask_min_totals
+        # 매매 중단·체결 등 사람이 알아야 할 일을 알린다. 커밋된 뒤에만 보낸다
+        self._notifier = notifier
         self._sleep = sleep
         self._clock = clock
         self._orders = OrderRepository()
@@ -131,6 +135,10 @@ class LiveExecutor:
         except UpbitUnknownResultError as error:
             # 접수됐는지 알 수 없다. 다시 보내지 않고 identifier로 확인한다
             logger.warning("order result unknown (market=%s, identifier=%s): %s", market, order.identifier, error)
+            self._notifier.notify(
+                f"⚠️ [주문 결과 확인 중] {market} {_label(order.reason)}\n"
+                "응답을 받지 못했습니다. 다시 보내지 않고 거래소에 조회해 결과를 반영합니다."
+            )
         except UpbitError as error:
             # 거래소가 접수하지 않은 것이 확실하다 (요청 오류, 권한, 요청 수 제한, 연결 실패 등)
             async with self._database.transaction() as conn:
@@ -190,6 +198,9 @@ class LiveExecutor:
         logger.warning(
             "order not found on exchange; recorded as failed (market=%s, identifier=%s)", market, order.identifier
         )
+        self._notifier.notify(
+            f"[주문 미접수] {market} {_label(order.reason)}\n거래소에 주문이 없어 실패로 기록했습니다."
+        )
         return failed
 
     async def _record_waiting(self, order: LiveOrder, found: Order) -> LiveOrder:
@@ -216,8 +227,9 @@ class LiveExecutor:
                     executed_funds=funds,
                     paid_fee=found.paid_fee,
                 )
+                position = None
                 if found.executed_volume > 0:
-                    await self._apply_fill(conn, market, finished, found)
+                    position = await self._apply_fill(conn, market, finished, found)
                     await IndicatorInfoRepository().clear_signal_states(conn, order.market_id)
         # 거래소 결과가 기록과 맞지 않거나(체결 합계 불일치 등) DB 제약·값 검사에 걸리면 반영할 수 없다
         except (InconsistentOrderError, asyncpg.IntegrityConstraintViolationError, ValueError) as error:
@@ -234,22 +246,24 @@ class LiveExecutor:
             finished.executed_funds,
             finished.paid_fee,
         )
+        # 커밋된 뒤에 알린다
+        self._notifier.notify(_fill_message(market, finished, position))
         return finished
 
-    async def _apply_fill(self, conn: asyncpg.Connection, market: str, order: LiveOrder, found: Order) -> None:
+    async def _apply_fill(self, conn: asyncpg.Connection, market: str, order: LiveOrder, found: Order) -> LivePosition:
+        """체결을 포지션에 반영하고, 반영한 뒤의 포지션을 돌려준다."""
         filled_at = max(trade.created_at for trade in found.trades)
         if order.side is OrderSide.BID and order.reason is Reason.ADD:
             # 추가 매수는 열린 포지션에 수량과 비용(수수료 포함)을 더한다. 평단가는 가중 평균이 된다 (매매 로직 5.6)
             current = await self._positions.get_open(conn, order.market_id)
             if current is None:
                 raise InconsistentOrderError("add buy filled without an open position")
-            await self._positions.add_buy(
+            return await self._positions.add_buy(
                 conn,
                 position_id=current.position_id,
                 volume=order.executed_volume,
                 cost=order.executed_funds + order.paid_fee,
             )
-            return
         if order.side is OrderSide.BID:
             # 평단가는 매수 수수료를 포함한다 (매매 로직 5.2)
             opened = await self._positions.open(
@@ -263,7 +277,7 @@ class LiveExecutor:
             )
             if opened is None:
                 raise InconsistentOrderError("buy filled while a position is already open")
-            return
+            return opened
         position = await self._positions.get_open(conn, order.market_id)
         if position is None:
             raise InconsistentOrderError("sell filled without an open position")
@@ -282,13 +296,55 @@ class LiveExecutor:
                 logger.warning(
                     "closing position with unsellable remainder (market=%s, volume=%s)", market, position.holding_volume
                 )
-            await self._positions.close(
+            position = await self._positions.close(
                 conn, position_id=position.position_id, closed_at=filled_at, exit_reason=order.reason
             )
+        return position
 
     def _halt(self, market: str, why: str) -> None:
         self._halted.add(market)
         logger.error("trading halted for %s until restart: %s", market, why)
+        self._notifier.notify(
+            f"🚨 [매매 중단] {market}\n{why}\n"
+            "재시작 전까지 이 마켓은 주문하지 않고 손절도 하지 않습니다. 확인이 필요합니다."
+        )
+
+
+_LABELS = {
+    Reason.ENTRY: "매수",
+    Reason.ADD: "추가 매수",
+    Reason.STOP_LOSS: "비상 손절",
+    Reason.TAKE_PROFIT: "익절",
+    Reason.OVERBOUGHT_EXIT: "과매수 매도",
+    Reason.DEAD_CROSS_EXIT: "데드크로스 매도",
+}
+
+
+def _label(reason: Reason) -> str:
+    return _LABELS[reason]
+
+
+def _won(value: Decimal) -> str:
+    return f"{value:,.0f}원"
+
+
+def _fill_message(market: str, order: LiveOrder, position: LivePosition | None) -> str:
+    """끝난 주문의 알림 문구. 체결이 없으면 취소 알림, 매도로 포지션이 닫히면 손익을 넣는다."""
+    if position is None:
+        return f"[주문 취소] {market} {_label(order.reason)}\n체결 없이 끝났습니다 ({order.state})."
+    filled = f"{order.executed_volume.normalize():f}개 · {_won(order.executed_funds)} (수수료 {order.paid_fee:,.2f}원)"
+    if order.side is OrderSide.BID:
+        return (
+            f"[{_label(order.reason)} 체결] {market}\n{filled}\n"
+            f"평단가 {_won(position.average_price)} · 매수 {position.buy_count}회째"
+        )
+    if position.closed_at is None:
+        return f"[{_label(order.reason)} 일부 체결] {market}\n{filled}\n남은 수량 {position.holding_volume.normalize():f}개"
+    profit = position.sold_proceeds - position.entry_cost
+    return (
+        f"[{_label(order.reason)} 체결] {market}\n{filled}\n"
+        f"포지션 종료 · 손익 {profit:+,.0f}원 ({profit / position.entry_cost * 100:+.2f}%) · 매수 {position.buy_count}회"
+    )
 
 
 def _executed_funds(order: Order) -> Decimal:

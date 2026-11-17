@@ -112,6 +112,14 @@ class FakeUpbit:
         return _order(self.market, identifier, side, state, trades, fee)
 
 
+class RecordingNotifier:
+    def __init__(self) -> None:
+        self.messages: list[str] = []
+
+    def notify(self, text: str) -> None:
+        self.messages.append(text)
+
+
 class Clock:
     def __init__(self) -> None:
         self.now = datetime.now(UTC)
@@ -128,6 +136,7 @@ class Env:
         self.upbit = FakeUpbit(market)
         self.clock = Clock()
         self.sleeps: list[float] = []
+        self.notifier = RecordingNotifier()
 
         async def sleep(seconds: float) -> None:
             self.sleeps.append(seconds)
@@ -137,6 +146,7 @@ class Env:
             database=database,
             exit_settings=EXIT,
             ask_min_totals={market: Decimal("5000")},
+            notifier=self.notifier,
             sleep=sleep,
             clock=self.clock,
         )
@@ -495,3 +505,99 @@ async def test_entry_fill_opens_position_with_first_buy_amount(env: Env) -> None
     position = await env.position()
     # 추가 매수 금액의 기준이 되는 첫 매수 주문 금액을 남긴다 (매매 로직 6.1)
     assert (position.buy_count, position.first_buy_amount) == (1, Decimal("5000.04"))
+
+
+# ---------------------------------------------------------------------------
+# 알림 (커밋된 뒤에 보낸다)
+# ---------------------------------------------------------------------------
+
+
+async def test_buy_fill_is_notified_with_average_price(env: Env) -> None:
+    env.upbit.lookups = [(OrderSide.BID, OrderState.DONE, BUY_FILL, "2.50002")]
+
+    await env.executor.buy(env.market, env.market_id, Decimal("5000.04"))
+
+    assert env.notifier.messages == [
+        f"[매수 체결] {env.market}\n0.001개 · 5,000원 (수수료 2.50원)\n평단가 5,002,540원 · 매수 1회째"
+    ]
+
+
+async def test_add_buy_fill_is_notified_with_buy_count(env: Env) -> None:
+    await env.open_position()
+    env.upbit.lookups = [(OrderSide.BID, OrderState.DONE, BUY_FILL, "2.50002")]
+
+    await env.executor.buy(env.market, env.market_id, Decimal("5000.04"), reason=Reason.ADD)
+
+    assert env.notifier.messages[-1].startswith(f"[추가 매수 체결] {env.market}\n")
+    assert env.notifier.messages[-1].endswith("매수 2회째")
+
+
+async def test_closing_sell_is_notified_with_profit(env: Env) -> None:
+    await env.open_position()
+    env.upbit.lookups = [(OrderSide.ASK, OrderState.DONE, (_trade("4600000", "0.001", "4600"),), "2.3")]
+
+    await env.executor.sell(env.market, env.market_id, Decimal("0.001"), Reason.STOP_LOSS)
+
+    # 손익 = 회수 금액(4,600 - 2.3) - 매수 비용(5,002.5)
+    assert env.notifier.messages == [
+        f"[비상 손절 체결] {env.market}\n0.001개 · 4,600원 (수수료 2.30원)\n"
+        "포지션 종료 · 손익 -405원 (-8.09%) · 매수 1회"
+    ]
+
+
+async def test_partial_sell_is_notified_with_remaining_volume(env: Env) -> None:
+    await env.open_position(volume="0.002", cost="10005")
+    env.upbit.lookups = [(OrderSide.ASK, OrderState.CANCEL, (_trade("5100000", "0.0005", "2550"),), "1.275")]
+
+    await env.executor.sell(env.market, env.market_id, Decimal("0.002"), Reason.OVERBOUGHT_EXIT)
+
+    assert env.notifier.messages[-1].startswith(f"[과매수 매도 일부 체결] {env.market}\n")
+    assert env.notifier.messages[-1].endswith("남은 수량 0.0015개")
+
+
+async def test_halt_is_notified(env: Env) -> None:
+    env.upbit.place_error = UpbitRequestError(
+        "POST /v1/orders failed (400 insufficient_funds_bid)", status=400, name="insufficient_funds_bid"
+    )
+
+    await env.executor.buy(env.market, env.market_id, Decimal("5000"))
+
+    assert len(env.notifier.messages) == 1
+    message = env.notifier.messages[0]
+    assert message.startswith(f"🚨 [매매 중단] {env.market}\n")
+    assert "insufficient_funds_bid" in message
+    assert "손절도 하지 않습니다" in message
+
+
+async def test_unknown_result_and_later_not_found_are_notified(env: Env) -> None:
+    env.upbit.place_error = UpbitTimeoutError("POST /v1/orders timed out")
+    env.upbit.lookups = [MISSING]
+    order = await env.executor.buy(env.market, env.market_id, Decimal("5000"))
+    assert order is not None
+    env.clock.now = order.created_at + NOT_FOUND_GRACE
+
+    await env.executor.resolve_unfinished(env.market, env.market_id)
+
+    assert [m.split("\n")[0] for m in env.notifier.messages] == [
+        f"⚠️ [주문 결과 확인 중] {env.market} 매수",
+        f"[주문 미접수] {env.market} 매수",
+    ]
+
+
+async def test_cancel_without_fill_is_notified(env: Env) -> None:
+    env.upbit.lookups = [(OrderSide.BID, OrderState.CANCEL, (), "0")]
+
+    await env.executor.buy(env.market, env.market_id, Decimal("5000"))
+
+    assert env.notifier.messages == [f"[주문 취소] {env.market} 매수\n체결 없이 끝났습니다 (cancel)."]
+
+
+async def test_inconsistent_result_notifies_halt_only(env: Env) -> None:
+    await env.open_position()
+    env.upbit.lookups = [(OrderSide.BID, OrderState.DONE, BUY_FILL, "2.50002")]
+
+    await env.executor.buy(env.market, env.market_id, Decimal("5000.04"))
+
+    # 반영하지 못한 체결은 체결 알림을 보내지 않고 매매 중단만 알린다
+    assert len(env.notifier.messages) == 1
+    assert env.notifier.messages[0].startswith("🚨 [매매 중단]")

@@ -1,12 +1,14 @@
 import argparse
 import asyncio
 import logging
+import os
 import sys
 from collections.abc import Sequence
 from pathlib import Path
 
 from src.app.application import Application
 from src.app.config import ConfigError, TradingConfig, load_config
+from src.app.notifier import DiscordNotifier, Notifier, NullNotifier
 from src.app.scheduler import CandleScheduler
 from src.connections.database import Database, DatabaseConfig
 from src.exchange.account import MARKET_STATE_ACTIVE, OrderChance
@@ -36,9 +38,17 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 
 async def run(
-    config_path: Path, config: TradingConfig, db_config: DatabaseConfig, credentials: UpbitCredentials | None = None
+    config_path: Path,
+    config: TradingConfig,
+    db_config: DatabaseConfig,
+    credentials: UpbitCredentials | None = None,
+    notifier: Notifier | None = None,
 ) -> None:
-    """봇을 실행한다. 실거래(config.live)면 credentials가 있어야 하고, 시작 전에 업비트 계좌를 확인한다."""
+    """봇을 실행한다. 실거래(config.live)면 credentials가 있어야 하고, 시작 전에 업비트 계좌를 확인한다.
+
+    notifier가 없으면 알림을 보내지 않는다.
+    """
+    notifier = notifier or NullNotifier()
     if config.live and credentials is None:
         raise StartupError("live trading needs upbit credentials")
     database = Database(db_config)
@@ -55,6 +65,7 @@ async def run(
                     database=database,
                     exit_settings=config.exit,
                     ask_min_totals={market: chance.ask_min_total for market, chance in chances.items()},
+                    notifier=notifier,
                 )
                 live = LiveTrader(
                     executor=executor,
@@ -90,6 +101,11 @@ async def run(
             realtime_exit = RealtimeExit(database=database, market_ids=market_ids, submit=app.submit, live=live)
             feed = TickerFeed(markets=config.markets, on_ticker=realtime_exit.on_ticker)
             app.add_service("ticker", feed.run)
+            if isinstance(notifier, DiscordNotifier):
+                app.add_service("notifier", notifier.run)
+            notifier.notify(
+                f"[봇 시작] {'실거래' if config.live else '모의 실행'} · {', '.join(config.markets)} · {config.timeframe}"
+            )
             await app.run()
     finally:
         await database.close()
@@ -139,6 +155,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         logger.error("invalid database config: %s", error)
         return EXIT_STARTUP_FAILED
 
+    notifier: Notifier = NullNotifier()
+    webhook_url = os.environ.get("DISCORD_WEBHOOK_URL")
+    if webhook_url:
+        try:
+            notifier = DiscordNotifier(webhook_url)
+        except ValueError as error:
+            logger.error("invalid notification config: %s", error)
+            return EXIT_STARTUP_FAILED
+
     credentials = None
     if config.live:
         try:
@@ -148,9 +173,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             return EXIT_STARTUP_FAILED
 
     try:
-        asyncio.run(run(args.config, config, db_config, credentials))
+        asyncio.run(run(args.config, config, db_config, credentials, notifier))
     except StartupError as error:
         logger.error("startup check failed: %s", error)
+        # 애플리케이션이 시작되지 않아 알림 서비스가 없으므로 바로 보낸다
+        if isinstance(notifier, DiscordNotifier):
+            asyncio.run(notifier.send_now(f"🚨 [시작 실패] 매매를 시작하지 않았습니다.\n{error}"))
         return EXIT_STARTUP_FAILED
     return EXIT_OK
 
