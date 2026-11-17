@@ -7,6 +7,7 @@ from pytest_mock import MockerFixture
 
 from src.app.application import Application
 from src.app.config import Timeframe, TradingConfig
+from src.app.notifier import DiscordNotifier
 from src.connections.database import Database, DatabaseConfig
 from src.exchange.account import Account, OrderChance
 from src.exchange.upbit_auth import UpbitCredentials
@@ -327,3 +328,63 @@ async def test_paper_run_has_no_live_trader(mocker: MockerFixture) -> None:
     trader.assert_not_called()
     assert worker.call_args.kwargs["live"] is None
     assert realtime_exit.call_args.kwargs["live"] is None
+
+
+# ---------------------------------------------------------------------------
+# 디스코드 알림
+# ---------------------------------------------------------------------------
+
+WEBHOOK = "https://discord.com/api/webhooks/1/secret-token"
+
+
+def test_main_invalid_webhook_fails_before_connecting(
+    tmp_path: Path, mocker: MockerFixture, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    config = tmp_path / "config.json"
+    config.write_text('{"timeframe": "30m", "markets": ["KRW-BTC"]}', encoding="utf-8")
+    for key, value in DB_ENV.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setenv("DISCORD_WEBHOOK_URL", "https://example.com/hook/secret-token")
+    connect = mocker.patch("src.main.Database.connect")
+
+    assert main(["--config", str(config)]) == EXIT_STARTUP_FAILED
+    connect.assert_not_called()
+    # 잘못된 값이어도 URL은 비밀값일 수 있어 로그에 남기지 않는다
+    assert "secret-token" not in caplog.text
+
+
+def test_main_startup_failure_is_notified_immediately(
+    tmp_path: Path, mocker: MockerFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _live_main_env(tmp_path, monkeypatch)
+    monkeypatch.setenv("UPBIT_ACCESS_KEY", CREDENTIALS.access_key)
+    monkeypatch.setenv("UPBIT_SECRET_KEY", CREDENTIALS.secret_key)
+    monkeypatch.setenv("DISCORD_WEBHOOK_URL", WEBHOOK)
+    stubs = _stub_startup(mocker)
+    stubs["accounts"].side_effect = UpbitAuthError(  # type: ignore[attr-defined]
+        "GET /v1/accounts failed (401 no_authorization_ip): ", status=401, name="no_authorization_ip"
+    )
+    send_now = mocker.patch("src.main.DiscordNotifier.send_now", new_callable=mocker.AsyncMock)
+
+    assert main(["--config", str(config)]) == EXIT_STARTUP_FAILED
+
+    # 애플리케이션이 시작되지 않았으므로 대기열 없이 바로 보낸다
+    text = send_now.await_args.args[0]
+    assert text.startswith("🚨 [시작 실패]")
+    assert "no_authorization_ip" in text
+    assert CREDENTIALS.secret_key not in text
+
+
+async def test_run_with_discord_registers_notifier_and_announces_start(mocker: MockerFixture) -> None:
+    _stub_startup(mocker)
+    add_service = mocker.spy(Application, "add_service")
+    executor = mocker.patch("src.main.LiveExecutor")
+    notifier = DiscordNotifier(WEBHOOK)
+    notify = mocker.patch.object(notifier, "notify")
+
+    await run(Path("config.json"), LIVE, DB_CONFIG, CREDENTIALS, notifier)
+
+    assert [call.args[1] for call in add_service.call_args_list] == ["scheduler:30m", "ticker", "notifier"]
+    # 실거래 주문 실행기가 같은 알림으로 매매 중단·체결을 알린다
+    assert executor.call_args.kwargs["notifier"] is notifier
+    notify.assert_called_once_with("[봇 시작] 실거래 · KRW-BTC, KRW-ETH · 30m")
