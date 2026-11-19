@@ -24,6 +24,11 @@ case "$1 $2" in
         fi
         ;;
     "compose up") [ "${FAKE_UP_FAILS:-0}" = 1 ] && exit 1 ;;
+    "compose exec")
+        # 마이그레이션은 표준 입력으로 받는다. 받은 SQL을 기록한다
+        cat >> "$DOCKER_CALLS.sql"
+        [ "${FAKE_MIGRATE_FAILS:-0}" = 1 ] && exit 3
+        ;;
 esac
 exit 0
 """
@@ -84,6 +89,10 @@ class Server:
 
     def docker_calls(self) -> list[str]:
         return self.calls.read_text(encoding="utf-8").splitlines()
+
+    def applied_sql(self) -> str:
+        path = self.calls.with_name(self.calls.name + ".sql")
+        return path.read_text(encoding="utf-8") if path.exists() else ""
 
 
 @pytest.fixture
@@ -241,3 +250,59 @@ def test_unknown_option_rejected(server: Server) -> None:
 
     assert result.returncode == 2
     assert "알 수 없는 옵션" in result.stderr
+
+
+MIGRATE_CALL = (
+    'compose exec -T db sh -c psql -q -v ON_ERROR_STOP=1 --single-transaction -U "$POSTGRES_USER" -d "$POSTGRES_DB"'
+)
+
+
+def test_new_migrations_are_applied_in_order_before_restart(server: Server) -> None:
+    server.push("db/migrations/20261119-02-create-b.sql", "CREATE TABLE IF NOT EXISTS b ();\n", "feat: b")
+    server.push("db/migrations/20261119-01-create-a2.sql", "CREATE TABLE IF NOT EXISTS a2 ();\n", "feat: a2")
+    server.push("db/schema.sql", "CREATE TABLE a ();\nCREATE TABLE a2 ();\nCREATE TABLE b ();\n", "feat: 스키마")
+
+    result = server.run()
+
+    # 스키마가 바뀌었어도 마이그레이션이 함께 오면 멈추지 않고 적용한다
+    assert result.returncode == 0, result.stderr
+    assert server.applied_sql() == "CREATE TABLE IF NOT EXISTS a2 ();\nCREATE TABLE IF NOT EXISTS b ();\n"
+    calls = server.docker_calls()
+    assert calls.count(MIGRATE_CALL) == 2
+    # 빌드가 끝난 뒤, 재시작하기 전에 적용한다
+    assert calls.index("compose build bot") < calls.index(MIGRATE_CALL) < calls.index("compose up -d")
+
+
+def test_migrations_already_on_server_are_not_applied_again(server: Server) -> None:
+    server.push("db/migrations/20261119-01-create-a2.sql", "CREATE TABLE IF NOT EXISTS a2 ();\n", "feat: a2")
+    assert server.run().returncode == 0
+    server.push("src/app.py", "print(1)\n", "feat: 새 기능")
+
+    result = server.run()
+
+    assert result.returncode == 0, result.stderr
+    assert server.docker_calls().count(MIGRATE_CALL) == 1
+
+
+def test_migration_failure_keeps_running_bot_and_reverts_code(server: Server) -> None:
+    server.push("db/migrations/20261119-01-create-a2.sql", "CREATE TABLE broken (;\n", "feat: 잘못된 마이그레이션")
+
+    result = server.run(FAKE_MIGRATE_FAILS="1")
+
+    assert result.returncode == 1
+    assert "마이그레이션(db/migrations/20261119-01-create-a2.sql) 적용에 실패했습니다" in result.stderr
+    assert server.head() == "script"
+    assert "compose up -d" not in server.docker_calls()
+
+
+def test_schema_change_with_only_modified_migration_stops(server: Server) -> None:
+    server.push("db/migrations/20261119-01-create-a2.sql", "CREATE TABLE IF NOT EXISTS a2 ();\n", "feat: a2")
+    assert server.run().returncode == 0
+    # 이미 적용된 마이그레이션을 고친 것은 새 마이그레이션이 아니다
+    server.push("db/migrations/20261119-01-create-a2.sql", "CREATE TABLE IF NOT EXISTS a3 ();\n", "fix: a3")
+    server.push("db/schema.sql", "CREATE TABLE a ();\nCREATE TABLE a3 ();\n", "feat: 스키마")
+
+    result = server.run()
+
+    assert result.returncode == 1
+    assert "db/schema.sql이 바뀌었습니다" in result.stderr
