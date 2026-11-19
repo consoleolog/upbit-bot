@@ -16,6 +16,7 @@ from src.exchange.ticker_feed import TickerFeed
 from src.exchange.upbit_auth import UpbitCredentials
 from src.exchange.upbit_client import UpbitClient, UpbitError
 from src.repositories.market import MarketRepository
+from src.repositories.models import MarketHalt
 from src.trading.live import LiveExecutor
 from src.trading.live_trader import LiveTrader
 from src.trading.market_worker import MarketWorker
@@ -58,6 +59,7 @@ async def run(
         market_ids = await register_markets(database, config.markets)
         async with UpbitClient(credentials=credentials) as upbit:
             live = None
+            halts: dict[str, MarketHalt] = {}
             if config.live:
                 chances = await check_live_account(upbit, config.markets)
                 executor = LiveExecutor(
@@ -67,6 +69,8 @@ async def run(
                     ask_min_totals={market: chance.ask_min_total for market, chance in chances.items()},
                     notifier=notifier,
                 )
+                # 이전 실행에서 중단된 마켓은 사람이 해제할 때까지 계속 막는다
+                halts = await executor.load_halts(market_ids)
                 live = LiveTrader(
                     executor=executor,
                     upbit=upbit,
@@ -103,9 +107,9 @@ async def run(
             app.add_service("ticker", feed.run)
             if isinstance(notifier, DiscordNotifier):
                 app.add_service("notifier", notifier.run)
-            notifier.notify(
-                f"[봇 시작] {'실거래' if config.live else '모의 실행'} · {', '.join(config.markets)} · {config.timeframe}"
-            )
+            started = f"[봇 시작] {'실거래' if config.live else '모의 실행'} · {', '.join(config.markets)} · {config.timeframe}"
+            halted = "".join(f"\n🚨 매매 중단 중: {market} ({halt.reason})" for market, halt in halts.items())
+            notifier.notify(started + halted)
             await app.run()
     finally:
         await database.close()

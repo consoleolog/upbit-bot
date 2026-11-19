@@ -10,8 +10,10 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
+import asyncpg
 import pytest
 import pytest_asyncio
+from pytest_mock import MockerFixture
 
 from src.app.config import ExitSettings
 from src.connections.database import Database
@@ -24,12 +26,14 @@ from src.exchange.upbit_client import (
 )
 from src.repositories.indicator_info import IndicatorInfoRepository
 from src.repositories.market import MarketRepository
+from src.repositories.market_halt import MarketHaltRepository
 from src.repositories.models import (
     IndicatorInfo,
     IndicatorType,
     LiveOrder,
     LiveOrderState,
     LivePosition,
+    MarketHalt,
     PositionStatus,
 )
 from src.repositories.order import OrderRepository
@@ -141,15 +145,24 @@ class Env:
         async def sleep(seconds: float) -> None:
             self.sleeps.append(seconds)
 
-        self.executor = LiveExecutor(
+        self._sleep = sleep
+        self.executor = self.new_executor()
+
+    def new_executor(self) -> LiveExecutor:
+        """같은 DB를 쓰는 새 실행기. 재시작을 흉내 낸다 (메모리 상태가 없음)."""
+        return LiveExecutor(
             upbit=self.upbit,
-            database=database,
+            database=self.database,
             exit_settings=EXIT,
-            ask_min_totals={market: Decimal("5000")},
+            ask_min_totals={self.market: Decimal("5000")},
             notifier=self.notifier,
-            sleep=sleep,
+            sleep=self._sleep,
             clock=self.clock,
         )
+
+    async def halts(self) -> list[MarketHalt]:
+        async with self.database.transaction() as conn:
+            return [halt for halt in await MarketHaltRepository().list_all(conn) if halt.market_id == self.market_id]
 
     async def unfinished(self) -> LiveOrder | None:
         async with self.database.transaction() as conn:
@@ -203,6 +216,7 @@ async def env(database: Database) -> AsyncIterator[Env]:
         yield Env(database, symbol, market.market_id)
     finally:
         async with database.transaction() as conn:
+            await conn.execute("DELETE FROM market_halt WHERE market_id = $1", market.market_id)
             await conn.execute("DELETE FROM orders WHERE market_id = $1", market.market_id)
             await conn.execute("DELETE FROM position WHERE market_id = $1", market.market_id)
             await conn.execute("DELETE FROM indicator_info WHERE market_id = $1", market.market_id)
@@ -601,3 +615,75 @@ async def test_inconsistent_result_notifies_halt_only(env: Env) -> None:
     # 반영하지 못한 체결은 체결 알림을 보내지 않고 매매 중단만 알린다
     assert len(env.notifier.messages) == 1
     assert env.notifier.messages[0].startswith("🚨 [매매 중단]")
+
+
+REJECTED = UpbitRequestError(
+    "POST /v1/orders failed (400 insufficient_funds_bid)", status=400, name="insufficient_funds_bid"
+)
+
+
+async def test_halt_is_saved_and_survives_restart(env: Env) -> None:
+    env.upbit.place_error = REJECTED
+    await env.executor.buy(env.market, env.market_id, Decimal("5000"))
+
+    [halt] = await env.halts()
+    assert halt.halted_at == env.clock.now
+    assert "insufficient_funds_bid" in halt.reason
+    assert "DB에 저장하지 못했습니다" not in env.notifier.messages[0]
+
+    # 재시작한 실행기도 기록된 중단을 읽어 이 마켓은 주문하지 않는다
+    restarted = env.new_executor()
+    assert not restarted.is_halted(env.market)
+    assert await restarted.load_halts({env.market: env.market_id}) == {env.market: halt}
+    assert restarted.is_halted(env.market)
+    assert await restarted.buy(env.market, env.market_id, Decimal("5000")) is None
+    assert await restarted.resolve_unfinished(env.market, env.market_id) is True
+    assert len(env.upbit.placed) == 1
+
+
+async def test_load_halts_ignores_markets_not_traded(env: Env) -> None:
+    env.upbit.place_error = REJECTED
+    await env.executor.buy(env.market, env.market_id, Decimal("5000"))
+
+    restarted = env.new_executor()
+
+    # 설정에서 뺀 마켓의 중단은 매매에 영향이 없다
+    assert await restarted.load_halts({"KRW-OTHER": env.market_id + 1_000_000}) == {}
+    assert not restarted.is_halted(env.market)
+
+
+async def test_halt_already_recorded_keeps_first_reason(env: Env) -> None:
+    async with env.database.transaction() as conn:
+        await MarketHaltRepository().add(conn, market_id=env.market_id, reason="first", halted_at=T0)
+    env.upbit.place_error = REJECTED
+
+    await env.executor.buy(env.market, env.market_id, Decimal("5000"))
+
+    assert env.executor.is_halted(env.market)
+    assert [halt.reason for halt in await env.halts()] == ["first"]
+    assert len(env.notifier.messages) == 1
+
+
+@pytest.mark.parametrize(
+    "failure", [OSError("connection lost"), TimeoutError(), asyncpg.PostgresConnectionError("terminated")]
+)
+async def test_halt_save_failure_still_blocks_and_warns(env: Env, mocker: MockerFixture, failure: Exception) -> None:
+    mocker.patch.object(MarketHaltRepository, "add", side_effect=failure)
+    env.upbit.place_error = REJECTED
+
+    await env.executor.buy(env.market, env.market_id, Decimal("5000"))
+
+    # DB에 쓰지 못해도 판단할 수 없는 상태에서 주문하지 않는다
+    assert env.executor.is_halted(env.market)
+    assert await env.executor.buy(env.market, env.market_id, Decimal("5000")) is None
+    assert await env.halts() == []
+    [message] = env.notifier.messages
+    assert message.startswith(f"🚨 [매매 중단] {env.market}\n")
+    assert "DB에 저장하지 못했습니다" in message
+
+
+async def test_load_halts_failure_raises(env: Env, mocker: MockerFixture) -> None:
+    mocker.patch.object(MarketHaltRepository, "list_all", side_effect=OSError("connection lost"))
+
+    with pytest.raises(OSError, match="connection lost"):
+        await env.new_executor().load_halts({env.market: env.market_id})
