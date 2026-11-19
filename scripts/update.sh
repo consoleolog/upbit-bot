@@ -8,7 +8,10 @@
 # 안전하지 않으면 재시작하지 않고 멈춘다.
 # - 서버 저장소에 커밋하지 않은 수정이 있으면 멈춘다 (덮어쓰지 않음)
 # - fast-forward로만 업데이트한다 (서버 저장소의 이력을 다시 쓰지 않음)
-# - db/schema.sql이 바뀌었으면 멈춘다. 기존 DB에는 스키마가 자동으로 적용되지 않으므로 직접 적용해야 한다
+# - 새로 추가된 db/migrations/*.sql은 빌드가 끝난 뒤, 재시작하기 전에 기존 DB에 이름 순서대로 적용한다
+#   (파일 이름은 날짜-순번-동사-대상.sql. 예: 20261119-01-create-market-halt.sql)
+#   (파일마다 한 트랜잭션. 마이그레이션은 여러 번 적용해도 결과가 같게 쓴다: CREATE TABLE IF NOT EXISTS 등)
+# - db/schema.sql이 바뀌었는데 새 마이그레이션이 없으면 멈춘다. 기존 DB에는 schema.sql이 자동으로 적용되지 않으므로 직접 적용해야 한다
 # - 새 이미지를 먼저 빌드하고, 빌드가 실패하면 기존 봇을 그대로 둔다
 # - 재시작 후 봇이 시작됐는지 확인하고, 실패하면 로그와 되돌리는 방법을 보여 준다
 
@@ -27,6 +30,7 @@ START_TIMEOUT_SECONDS="${START_TIMEOUT_SECONDS:-60}"
 FETCH_TIMEOUT=60
 BUILD_TIMEOUT=900
 UP_TIMEOUT=180
+MIGRATE_TIMEOUT=60
 
 cd "$(dirname "$0")/.."
 
@@ -70,7 +74,10 @@ git merge-base --is-ancestor "$before" "$after" ||
 echo "== 받을 커밋"
 git log --format='  %h %s' "$before..$after"
 
-if [ "$SCHEMA_APPLIED" = false ] && ! git diff --quiet "$before" "$after" -- db/schema.sql; then
+# 이번에 새로 추가된 마이그레이션 (이름 순서)
+mapfile -t migrations < <(git diff --name-only --diff-filter=A "$before" "$after" -- 'db/migrations/*.sql' | sort)
+
+if [ "$SCHEMA_APPLIED" = false ] && [ "${#migrations[@]}" -eq 0 ] && ! git diff --quiet "$before" "$after" -- db/schema.sql; then
     git diff "$before" "$after" -- db/schema.sql
     fail "db/schema.sql이 바뀌었습니다. 코드는 아직 업데이트하지 않았습니다.
   위 변경을 기존 DB에 직접 적용한 뒤 '$0 --schema-applied'로 다시 실행해 주세요."
@@ -82,6 +89,20 @@ echo "== 이미지 빌드"
 if ! timeout "$BUILD_TIMEOUT" "${DOCKER[@]}" compose build bot; then
     git reset --quiet --keep "$before"
     fail "이미지 빌드에 실패했습니다. 코드를 이전 커밋($(git rev-parse --short "$before"))으로 되돌렸고, 기존 봇은 그대로 실행 중입니다."
+fi
+
+if [ "${#migrations[@]}" -gt 0 ]; then
+    echo "== DB 마이그레이션"
+    for migration in "${migrations[@]}"; do
+        echo "  $migration"
+        # DB 컨테이너 안의 접속 정보로 적용한다. 오류가 나면 그 파일은 롤백되고 멈춘다
+        if ! timeout "$MIGRATE_TIMEOUT" "${DOCKER[@]}" compose exec -T db \
+            sh -c 'psql -q -v ON_ERROR_STOP=1 --single-transaction -U "$POSTGRES_USER" -d "$POSTGRES_DB"' <"$migration"; then
+            git reset --quiet --keep "$before"
+            fail "마이그레이션($migration) 적용에 실패했습니다. 코드를 이전 커밋($(git rev-parse --short "$before"))으로 되돌렸고, 기존 봇은 그대로 실행 중입니다.
+  앞서 적용된 마이그레이션은 그대로 남지만 여러 번 적용해도 되므로, 원인을 고친 뒤 다시 실행하면 됩니다."
+        fi
+    done
 fi
 
 echo "== 재시작"
