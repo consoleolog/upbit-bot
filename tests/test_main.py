@@ -389,7 +389,14 @@ async def test_run_with_discord_registers_notifier_and_announces_start(mocker: M
 
     await run(Path("config.json"), LIVE, DB_CONFIG, CREDENTIALS, notifier)
 
-    assert [call.args[1] for call in add_service.call_args_list] == ["scheduler:30m", "ticker", "notifier"]
+    assert [call.args[1] for call in add_service.call_args_list] == [
+        "scheduler:30m",
+        "ticker",
+        "notifier",
+        "halt-reminder",
+    ]
+    # 매매 중단이 이어지면 실행기가 다시 알린다
+    assert add_service.call_args_list[-1].args[2] is executor.return_value.remind_halts
     # 실거래 주문 실행기가 같은 알림으로 매매 중단·체결을 알린다
     assert executor.call_args.kwargs["notifier"] is notifier
     notify.assert_called_once_with("[봇 시작] 실거래 · KRW-BTC, KRW-ETH · 30m")
