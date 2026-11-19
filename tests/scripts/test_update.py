@@ -24,10 +24,12 @@ case "$1 $2" in
         fi
         ;;
     "compose up") [ "${FAKE_UP_FAILS:-0}" = 1 ] && exit 1 ;;
+    "compose stop") [ "${FAKE_STOP_FAILS:-0}" = 1 ] && exit 1 ;;
     "compose exec")
-        # 마이그레이션은 표준 입력으로 받는다. 받은 SQL을 기록한다
+        # 마이그레이션은 표준 입력으로 받는다. 받은 SQL을 기록하고, FAKE_MIGRATE_FAIL_AT번째 적용을 실패시킨다
         cat >> "$DOCKER_CALLS.sql"
-        [ "${FAKE_MIGRATE_FAILS:-0}" = 1 ] && exit 3
+        count=$(grep -c "^compose exec" "$DOCKER_CALLS")
+        [ "$count" = "${FAKE_MIGRATE_FAIL_AT:-0}" ] && exit "${FAKE_MIGRATE_EXIT:-3}"
         ;;
 esac
 exit 0
@@ -269,8 +271,13 @@ def test_new_migrations_are_applied_in_order_before_restart(server: Server) -> N
     assert server.applied_sql() == "CREATE TABLE IF NOT EXISTS a2 ();\nCREATE TABLE IF NOT EXISTS b ();\n"
     calls = server.docker_calls()
     assert calls.count(MIGRATE_CALL) == 2
-    # 빌드가 끝난 뒤, 재시작하기 전에 적용한다
-    assert calls.index("compose build bot") < calls.index(MIGRATE_CALL) < calls.index("compose up -d")
+    # 빌드가 끝난 뒤 봇을 멈추고 적용한 다음 새 봇을 시작한다 (옛 봇이 바뀐 스키마로 돌지 않음)
+    assert (
+        calls.index("compose build bot")
+        < calls.index("compose stop bot")
+        < calls.index(MIGRATE_CALL)
+        < calls.index("compose up -d")
+    )
 
 
 def test_migrations_already_on_server_are_not_applied_again(server: Server) -> None:
@@ -284,15 +291,65 @@ def test_migrations_already_on_server_are_not_applied_again(server: Server) -> N
     assert server.docker_calls().count(MIGRATE_CALL) == 1
 
 
-def test_migration_failure_keeps_running_bot_and_reverts_code(server: Server) -> None:
+def test_first_migration_failure_restarts_previous_bot(server: Server) -> None:
     server.push("db/migrations/20261119-01-create-a2.sql", "CREATE TABLE broken (;\n", "feat: 잘못된 마이그레이션")
 
-    result = server.run(FAKE_MIGRATE_FAILS="1")
+    result = server.run(FAKE_MIGRATE_FAIL_AT="1")
 
     assert result.returncode == 1
     assert "마이그레이션(db/migrations/20261119-01-create-a2.sql) 적용에 실패했습니다" in result.stderr
+    # 실패한 파일은 롤백돼 DB가 그대로이므로, 멈춰 둔 이전 봇(컨테이너)을 다시 시작한다
+    assert "이전 봇을 다시 시작했습니다" in result.stderr
     assert server.head() == "script"
-    assert "compose up -d" not in server.docker_calls()
+    calls = server.docker_calls()
+    assert calls.index("compose stop bot") < calls.index("compose start bot")
+    assert "compose up -d" not in calls
+
+
+@pytest.mark.parametrize(
+    ("fail_at", "exit_code"), [("2", "3"), ("1", "124")], ids=["after-earlier-migration-applied", "timeout"]
+)
+def test_uncertain_migration_failure_leaves_bot_stopped(server: Server, fail_at: str, exit_code: str) -> None:
+    server.push("db/migrations/20261119-01-create-a2.sql", "CREATE TABLE IF NOT EXISTS a2 ();\n", "feat: a2")
+    server.push("db/migrations/20261119-02-create-b.sql", "CREATE TABLE IF NOT EXISTS b ();\n", "feat: b")
+
+    result = server.run(FAKE_MIGRATE_FAIL_AT=fail_at, FAKE_MIGRATE_EXIT=exit_code)
+
+    # 앞 파일이 적용됐거나 커밋 여부를 알 수 없으면, 이전 봇이 바뀐 스키마로 돌지 않게 멈춘 채로 둔다
+    assert result.returncode == 1
+    assert "봇을 멈춘 채로 두었습니다" in result.stderr
+    assert "compose start bot" in result.stderr
+    assert server.head() == "script"
+    calls = server.docker_calls()
+    assert "compose start bot" not in calls
+    assert "compose up -d" not in calls
+
+
+def test_stop_failure_does_not_migrate(server: Server) -> None:
+    server.push("db/migrations/20261119-01-create-a2.sql", "CREATE TABLE IF NOT EXISTS a2 ();\n", "feat: a2")
+
+    result = server.run(FAKE_STOP_FAILS="1")
+
+    assert result.returncode == 1
+    assert "봇을 멈추지 못해" in result.stderr
+    assert server.head() == "script"
+    assert MIGRATE_CALL not in server.docker_calls()
+
+
+def test_start_timeout_after_migration_warns_schema_remains(server: Server) -> None:
+    server.push("db/migrations/20261119-01-create-a2.sql", "CREATE TABLE IF NOT EXISTS a2 ();\n", "feat: a2")
+
+    result = server.run(FAKE_STARTED="0")
+
+    assert result.returncode == 1
+    assert "적용한 마이그레이션은 DB에 남습니다" in result.stderr
+
+
+def test_update_without_migration_does_not_stop_bot(server: Server) -> None:
+    server.push("src/app.py", "print(1)\n", "feat: 새 기능")
+
+    assert server.run().returncode == 0
+    assert "compose stop bot" not in server.docker_calls()
 
 
 def test_schema_change_with_only_modified_migration_stops(server: Server) -> None:
