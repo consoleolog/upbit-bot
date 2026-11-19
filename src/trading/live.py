@@ -19,7 +19,8 @@ from src.connections.database import Database
 from src.exchange.order import Order, OrderSide, OrderState
 from src.exchange.upbit_client import UpbitError, UpbitUnknownResultError
 from src.repositories.indicator_info import IndicatorInfoRepository
-from src.repositories.models import LiveOrder, LiveOrderState, LivePosition
+from src.repositories.market_halt import MarketHaltRepository
+from src.repositories.models import LiveOrder, LiveOrderState, LivePosition, MarketHalt
 from src.repositories.order import OrderRepository
 from src.repositories.position import PositionRepository
 from src.trading.reasons import Reason
@@ -49,7 +50,8 @@ class InconsistentOrderError(Exception):
 class LiveExecutor:
     """마켓별 실거래 주문을 실행한다. 같은 마켓의 작업은 애플리케이션의 마켓 잠금 안에서 하나씩 실행된다고 가정한다.
 
-    상태를 확신할 수 없는 일이 생기면 그 마켓의 매매를 중단한다(메모리, 재시작 전까지). 사람이 확인해야 한다.
+    상태를 확신할 수 없는 일이 생기면 그 마켓의 매매를 중단한다. 중단은 DB에 기록해 재시작해도 유지되고,
+    사람이 확인하고 해제할 때까지 풀리지 않는다. 시작할 때 load_halts로 기록된 중단을 읽어야 한다.
     """
 
     def __init__(
@@ -75,10 +77,26 @@ class LiveExecutor:
         self._clock = clock
         self._orders = OrderRepository()
         self._positions = PositionRepository()
+        self._halts = MarketHaltRepository()
+        # 중단된 마켓의 메모리 사본. 기준은 market_halt 테이블이다
         self._halted: set[str] = set()
 
     def is_halted(self, market: str) -> bool:
         return market in self._halted
+
+    async def load_halts(self, market_ids: Mapping[str, int]) -> dict[str, MarketHalt]:
+        """DB에 기록된 중단을 읽어 메모리에 반영하고, 매매하는 마켓의 중단을 돌려준다. 매매를 시작하기 전에 부른다.
+
+        읽지 못하면 예외가 그대로 나간다. 어느 마켓이 중단됐는지 모른 채 매매를 시작하지 않는다.
+        """
+        async with self._database.transaction() as conn:
+            halts = await self._halts.list_all(conn)
+        markets = {market_id: market for market, market_id in market_ids.items()}
+        loaded = {markets[halt.market_id]: halt for halt in halts if halt.market_id in markets}
+        self._halted.update(loaded)
+        for market, halt in loaded.items():
+            logger.warning("trading halted for %s since %s: %s", market, halt.halted_at, halt.reason)
+        return loaded
 
     async def resolve_unfinished(self, market: str, market_id: int) -> bool:
         """마켓에 끝나지 않은 주문이 있으면 거래소에서 결과를 확인해 반영한다. 있었으면 True.
@@ -151,7 +169,7 @@ class LiveExecutor:
                     paid_fee=Decimal(0),
                 )
             # 같은 주문이 매 판단마다 거절되는 것을 막는다. 잔고가 기록과 다른 경우 등은 사람이 확인해야 한다
-            self._halt(market, f"order rejected ({error.status} {error.name}): {error}")
+            await self._halt(market, market_id, f"order rejected ({error.status} {error.name}): {error}")
             return failed
         return await self._confirm(market, order, attempts=CONFIRM_ATTEMPTS)
 
@@ -167,8 +185,10 @@ class LiveExecutor:
                 logger.warning("order check failed (market=%s, identifier=%s): %s", market, order.identifier, error)
                 continue
             if found is not None and (found.market, found.side) != (market, order.side):
-                self._halt(
-                    market, f"exchange order {order.identifier} does not match record: {found.market} {found.side}"
+                await self._halt(
+                    market,
+                    order.market_id,
+                    f"exchange order {order.identifier} does not match record: {found.market} {found.side}",
                 )
                 return order
             if found is None:
@@ -234,7 +254,7 @@ class LiveExecutor:
         # 거래소 결과가 기록과 맞지 않거나(체결 합계 불일치 등) DB 제약·값 검사에 걸리면 반영할 수 없다
         except (InconsistentOrderError, asyncpg.IntegrityConstraintViolationError, ValueError) as error:
             # 반영하지 않았으므로 주문은 끝나지 않은 상태로 남고, 이 마켓은 새 주문을 내지 않는다
-            self._halt(market, f"cannot apply order {order.identifier}: {error}")
+            await self._halt(market, order.market_id, f"cannot apply order {order.identifier}: {error}")
             return order
         logger.info(
             "order finished (market=%s, side=%s, reason=%s, state=%s, volume=%s, funds=%s, fee=%s)",
@@ -301,12 +321,23 @@ class LiveExecutor:
             )
         return position
 
-    def _halt(self, market: str, why: str) -> None:
+    async def _halt(self, market: str, market_id: int, why: str) -> None:
+        """마켓의 매매를 중단한다. DB에 기록하고 커밋한 뒤 메모리 사본에 반영하고 알린다."""
+        saved = True
+        try:
+            async with self._database.transaction() as conn:
+                # 이미 기록돼 있으면(None) 처음 사유를 그대로 둔다
+                await self._halts.add(conn, market_id=market_id, reason=why, halted_at=self._clock())
+        # DB에 쓰지 못해도(연결 끊김, 시간 초과, DB 오류) 매매는 막는다. 판단할 수 없는 상태에서 주문하지 않는다
+        except (asyncpg.PostgresError, asyncpg.InterfaceError, OSError, TimeoutError) as error:
+            saved = False
+            logger.error("cannot save trading halt for %s (%s); halted in memory only", market, type(error).__name__)
         self._halted.add(market)
-        logger.error("trading halted for %s until restart: %s", market, why)
+        logger.error("trading halted for %s until released: %s", market, why)
+        warning = "" if saved else "\n⚠️ 중단 상태를 DB에 저장하지 못했습니다. 재시작하면 중단이 풀릴 수 있습니다."
         self._notifier.notify(
             f"🚨 [매매 중단] {market}\n{why}\n"
-            "재시작 전까지 이 마켓은 주문하지 않고 손절도 하지 않습니다. 확인이 필요합니다."
+            "사람이 확인하고 해제하기 전까지(재시작해도) 이 마켓은 주문하지 않고 손절도 하지 않습니다." + warning
         )
 
 
