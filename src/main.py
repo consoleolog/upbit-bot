@@ -59,6 +59,7 @@ async def run(
         market_ids = await register_markets(database, config.markets)
         async with UpbitClient(credentials=credentials) as upbit:
             live = None
+            executor: LiveExecutor | None = None
             halts: dict[str, MarketHalt] = {}
             if config.live:
                 chances = await check_live_account(upbit, config.markets)
@@ -107,6 +108,9 @@ async def run(
             app.add_service("ticker", feed.run)
             if isinstance(notifier, DiscordNotifier):
                 app.add_service("notifier", notifier.run)
+            if executor is not None:
+                # 중단이 이어지는 동안 몇 시간마다 다시 알린다
+                app.add_service("halt-reminder", executor.remind_halts)
             started = f"[봇 시작] {'실거래' if config.live else '모의 실행'} · {', '.join(config.markets)} · {config.timeframe}"
             halted = "".join(f"\n🚨 매매 중단 중: {market} ({halt.reason})" for market, halt in halts.items())
             notifier.notify(started + halted)

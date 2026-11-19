@@ -4,6 +4,7 @@
 안전한 상태(끝나지 않은 주문으로 남거나 매매 중단)로 남는지 확인한다.
 """
 
+import asyncio
 import uuid
 from collections.abc import AsyncIterator, Callable
 from dataclasses import replace
@@ -38,7 +39,7 @@ from src.repositories.models import (
 )
 from src.repositories.order import OrderRepository
 from src.repositories.position import PositionRepository
-from src.trading.live import NOT_FOUND_GRACE, LiveExecutor
+from src.trading.live import HALT_REMIND_INTERVAL, NOT_FOUND_GRACE, LiveExecutor
 from src.trading.reasons import Reason
 from src.trading.signals import CrossState
 
@@ -140,10 +141,14 @@ class Env:
         self.upbit = FakeUpbit(market)
         self.clock = Clock()
         self.sleeps: list[float] = []
+        # 이만큼 기다리면 취소한다 (끝나지 않는 서비스를 멈추는 데 쓴다). None이면 멈추지 않는다
+        self.cancel_after_sleeps: int | None = None
         self.notifier = RecordingNotifier()
 
         async def sleep(seconds: float) -> None:
             self.sleeps.append(seconds)
+            if len(self.sleeps) == self.cancel_after_sleeps:
+                raise asyncio.CancelledError
 
         self._sleep = sleep
         self.executor = self.new_executor()
@@ -687,3 +692,32 @@ async def test_load_halts_failure_raises(env: Env, mocker: MockerFixture) -> Non
 
     with pytest.raises(OSError, match="connection lost"):
         await env.new_executor().load_halts({env.market: env.market_id})
+
+
+async def _remind_twice(env: Env) -> list[float]:
+    """remind_halts를 두 번 기다린 뒤 멈춘다(두 번째 대기에서 취소). 기다린 시간을 돌려준다."""
+    env.cancel_after_sleeps = len(env.sleeps) + 2
+    with pytest.raises(asyncio.CancelledError):
+        await env.executor.remind_halts()
+    return env.sleeps[-2:]
+
+
+async def test_remind_halts_without_halt_sends_nothing(env: Env) -> None:
+    waits = await _remind_twice(env)
+
+    assert waits == [HALT_REMIND_INTERVAL.total_seconds()] * 2
+    assert env.notifier.messages == []
+
+
+async def test_remind_halts_repeats_halted_markets(env: Env) -> None:
+    env.clock.now = datetime(2026, 11, 19, 3, 30, tzinfo=UTC)  # 한국 시간 11-19 12:30
+    env.upbit.place_error = REJECTED
+    await env.executor.buy(env.market, env.market_id, Decimal("5000"))
+
+    await _remind_twice(env)
+
+    # 중단된 마켓은 손절도 하지 않으므로 방치되지 않게 다시 알린다
+    assert len(env.notifier.messages) == 2
+    reminder = env.notifier.messages[1]
+    assert reminder.startswith("🚨 [매매 중단 중] 확인이 필요합니다.")
+    assert f"\n{env.market} · 11-19 12:30부터 · order rejected (400 insufficient_funds_bid)" in reminder

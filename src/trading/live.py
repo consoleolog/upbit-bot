@@ -16,6 +16,7 @@ import asyncpg
 from src.app.config import ExitSettings
 from src.app.notifier import Notifier
 from src.connections.database import Database
+from src.exchange.candle import KST
 from src.exchange.order import Order, OrderSide, OrderState
 from src.exchange.upbit_client import UpbitError, UpbitUnknownResultError
 from src.repositories.indicator_info import IndicatorInfoRepository
@@ -33,6 +34,8 @@ CONFIRM_INTERVAL = 1.0
 # 응답을 받지 못한 주문을 조회했는데 없다고 나와도, 기록한 지 이만큼 지나기 전에는 접수되지 않았다고 단정하지 않는다.
 # 타임아웃 직후에는 거래소에 아직 반영되지 않았을 수 있고, 그때 실패로 보고 새 주문을 내면 중복 주문이 된다
 NOT_FOUND_GRACE = timedelta(seconds=60)
+# 매매 중단이 이어지는 동안 다시 알리는 간격. 중단된 마켓은 손절도 하지 않으므로 방치되지 않게 한다
+HALT_REMIND_INTERVAL = timedelta(hours=6)
 
 
 class OrderClient(Protocol):
@@ -78,11 +81,26 @@ class LiveExecutor:
         self._orders = OrderRepository()
         self._positions = PositionRepository()
         self._halts = MarketHaltRepository()
-        # 중단된 마켓의 메모리 사본. 기준은 market_halt 테이블이다
-        self._halted: set[str] = set()
+        # 중단된 마켓의 메모리 사본. 기준은 market_halt 테이블이다 (DB에 저장하지 못한 중단은 메모리에만 있다)
+        self._halted: dict[str, MarketHalt] = {}
 
     def is_halted(self, market: str) -> bool:
         return market in self._halted
+
+    async def remind_halts(self, interval: timedelta = HALT_REMIND_INTERVAL) -> None:
+        """중단된 마켓이 있으면 interval마다 다시 알린다. 애플리케이션의 서비스로 실행한다 (취소될 때까지)."""
+        while True:
+            await self._sleep(interval.total_seconds())
+            if not self._halted:
+                continue
+            lines = [
+                f"{market} · {halt.halted_at.astimezone(KST):%m-%d %H:%M}부터 · {halt.reason}"
+                for market, halt in sorted(self._halted.items())
+            ]
+            self._notifier.notify(
+                "🚨 [매매 중단 중] 확인이 필요합니다. 이 마켓들은 주문하지 않고 손절도 하지 않습니다.\n"
+                + "\n".join(lines)
+            )
 
     async def load_halts(self, market_ids: Mapping[str, int]) -> dict[str, MarketHalt]:
         """DB에 기록된 중단을 읽어 메모리에 반영하고, 매매하는 마켓의 중단을 돌려준다. 매매를 시작하기 전에 부른다.
@@ -323,16 +341,17 @@ class LiveExecutor:
 
     async def _halt(self, market: str, market_id: int, why: str) -> None:
         """마켓의 매매를 중단한다. DB에 기록하고 커밋한 뒤 메모리 사본에 반영하고 알린다."""
+        halt = MarketHalt(market_id=market_id, reason=why, halted_at=self._clock())
         saved = True
         try:
             async with self._database.transaction() as conn:
                 # 이미 기록돼 있으면(None) 처음 사유를 그대로 둔다
-                await self._halts.add(conn, market_id=market_id, reason=why, halted_at=self._clock())
+                await self._halts.add(conn, market_id=market_id, reason=why, halted_at=halt.halted_at)
         # DB에 쓰지 못해도(연결 끊김, 시간 초과, DB 오류) 매매는 막는다. 판단할 수 없는 상태에서 주문하지 않는다
         except (asyncpg.PostgresError, asyncpg.InterfaceError, OSError, TimeoutError) as error:
             saved = False
             logger.error("cannot save trading halt for %s (%s); halted in memory only", market, type(error).__name__)
-        self._halted.add(market)
+        self._halted[market] = halt
         logger.error("trading halted for %s until released: %s", market, why)
         warning = "" if saved else "\n⚠️ 중단 상태를 DB에 저장하지 못했습니다. 재시작하면 중단이 풀릴 수 있습니다."
         self._notifier.notify(
