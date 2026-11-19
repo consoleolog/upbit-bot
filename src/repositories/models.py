@@ -233,3 +233,16 @@ class LivePosition:
             buy_count=row["buy_count"],
             first_buy_amount=row["first_buy_amount"],
         )
+
+
+@dataclass(frozen=True, kw_only=True)
+class MarketHalt:
+    """실거래 매매 중단. 행이 있는 마켓은 사람이 해제할 때까지 주문하지 않는다."""
+
+    market_id: int
+    reason: str
+    halted_at: datetime
+
+    @classmethod
+    def from_record(cls, row: asyncpg.Record) -> Self:
+        return cls(market_id=row["market_id"], reason=row["reason"], halted_at=row["halted_at"])
