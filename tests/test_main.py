@@ -1,4 +1,5 @@
 import uuid
+from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 
@@ -13,6 +14,7 @@ from src.exchange.account import Account, OrderChance
 from src.exchange.upbit_auth import UpbitCredentials
 from src.exchange.upbit_client import UpbitAuthError
 from src.main import EXIT_OK, EXIT_STARTUP_FAILED, StartupError, main, parse_args, register_markets, run
+from src.repositories.models import MarketHalt
 from src.trading.indicators import IndicatorSettings
 from src.trading.signals import SignalSettings, Threshold
 
@@ -206,6 +208,7 @@ def _stub_startup(mocker: MockerFixture) -> dict[str, object]:
     )
     return {
         "run": mocker.patch("src.main.Application.run", new_callable=mocker.AsyncMock),
+        "halts": mocker.patch("src.main.LiveExecutor.load_halts", new_callable=mocker.AsyncMock, return_value={}),
         "accounts": mocker.patch(
             "src.main.UpbitClient.get_accounts", new_callable=mocker.AsyncMock, return_value=[account]
         ),
@@ -305,6 +308,7 @@ async def test_live_run_passes_live_trader_to_worker_and_realtime_exit(mocker: M
     realtime_exit = mocker.patch("src.main.RealtimeExit")
     trader = mocker.patch("src.main.LiveTrader")
     executor = mocker.patch("src.main.LiveExecutor")
+    executor.return_value.load_halts = mocker.AsyncMock(return_value={})
 
     await run(Path("config.json"), LIVE, DB_CONFIG, CREDENTIALS)
 
@@ -379,12 +383,58 @@ async def test_run_with_discord_registers_notifier_and_announces_start(mocker: M
     _stub_startup(mocker)
     add_service = mocker.spy(Application, "add_service")
     executor = mocker.patch("src.main.LiveExecutor")
+    executor.return_value.load_halts = mocker.AsyncMock(return_value={})
     notifier = DiscordNotifier(WEBHOOK)
     notify = mocker.patch.object(notifier, "notify")
 
     await run(Path("config.json"), LIVE, DB_CONFIG, CREDENTIALS, notifier)
 
-    assert [call.args[1] for call in add_service.call_args_list] == ["scheduler:30m", "ticker", "notifier"]
+    assert [call.args[1] for call in add_service.call_args_list] == [
+        "scheduler:30m",
+        "ticker",
+        "notifier",
+        "halt-reminder",
+    ]
+    # 매매 중단이 이어지면 실행기가 다시 알린다
+    assert add_service.call_args_list[-1].args[2] is executor.return_value.remind_halts
     # 실거래 주문 실행기가 같은 알림으로 매매 중단·체결을 알린다
     assert executor.call_args.kwargs["notifier"] is notifier
     notify.assert_called_once_with("[봇 시작] 실거래 · KRW-BTC, KRW-ETH · 30m")
+
+
+async def test_live_run_loads_halts_and_announces_them(mocker: MockerFixture) -> None:
+    stubs = _stub_startup(mocker)
+    halt = MarketHalt(
+        market_id=2, reason="order rejected (400 insufficient_funds_ask)", halted_at=datetime(2026, 11, 1, tzinfo=UTC)
+    )
+    stubs["halts"].return_value = {"KRW-ETH": halt}  # type: ignore[attr-defined]
+    notifier = DiscordNotifier(WEBHOOK)
+    notify = mocker.patch.object(notifier, "notify")
+
+    await run(Path("config.json"), LIVE, DB_CONFIG, CREDENTIALS, notifier)
+
+    # 이전 실행에서 중단된 마켓을 매매 시작 전에 읽는다
+    stubs["halts"].assert_awaited_once_with({"KRW-BTC": 1, "KRW-ETH": 2})  # type: ignore[attr-defined]
+    notify.assert_called_once_with(
+        "[봇 시작] 실거래 · KRW-BTC, KRW-ETH · 30m\n"
+        "🚨 매매 중단 중: KRW-ETH (order rejected (400 insufficient_funds_ask))"
+    )
+
+
+async def test_live_run_does_not_start_when_halts_cannot_be_read(mocker: MockerFixture) -> None:
+    stubs = _stub_startup(mocker)
+    stubs["halts"].side_effect = OSError("connection lost")  # type: ignore[attr-defined]
+
+    # 어느 마켓이 중단됐는지 모른 채 매매를 시작하지 않는다
+    with pytest.raises(OSError, match="connection lost"):
+        await run(Path("config.json"), LIVE, DB_CONFIG, CREDENTIALS)
+
+    stubs["run"].assert_not_awaited()  # type: ignore[attr-defined]
+
+
+async def test_paper_run_does_not_load_halts(mocker: MockerFixture) -> None:
+    stubs = _stub_startup(mocker)
+
+    await run(Path("config.json"), TradingConfig(timeframe=Timeframe.MINUTE_30, markets=("KRW-BTC",)), DB_CONFIG)
+
+    stubs["halts"].assert_not_awaited()  # type: ignore[attr-defined]
