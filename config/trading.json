@@ -1,5 +1,5 @@
 {
-  "live": true,
+  "live": false,
   "timeframe": "30m",
   "markets": ["KRW-BTC", "KRW-ETH", "KRW-SOL"],
   "indicator": {
