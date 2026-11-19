@@ -162,6 +162,15 @@ CREATE TABLE position (
 -- 마켓당 열린 포지션은 하나 (매매 로직 5.1). 같은 마켓을 두 번 사는 것을 DB에서 막는다
 CREATE UNIQUE INDEX position_open_market ON position (market_id) WHERE status = 'OPEN';
 
+-- 실거래 매매 중단. 행이 있는 마켓은 주문하지 않는다(비상 손절 포함). 재시작해도 유지되고, 사람이 확인한 뒤 해제할 때만 지운다.
+-- 마켓당 하나다. 이미 중단된 마켓을 다시 중단해도 처음 기록한 사유를 그대로 둔다
+CREATE TABLE market_halt (
+    market_id int         PRIMARY KEY REFERENCES market (market_id),
+    reason    text        NOT NULL,
+    halted_at timestamptz NOT NULL,
+    CONSTRAINT market_halt_reason_check CHECK (btrim(reason) <> '')
+);
+
 CREATE FUNCTION set_updated_at() RETURNS trigger
 LANGUAGE plpgsql AS $$
 BEGIN
