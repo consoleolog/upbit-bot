@@ -13,6 +13,7 @@
 #   (파일 이름은 날짜-순번-동사-대상.sql. 예: 20261119-01-create-market-halt.sql)
 #   (파일마다 한 트랜잭션. 마이그레이션은 여러 번 적용해도 결과가 같게 쓴다: CREATE TABLE IF NOT EXISTS 등)
 # - db/schema.sql이 바뀌었는데 새 마이그레이션이 없으면 멈춘다. 기존 DB에는 schema.sql이 자동으로 적용되지 않으므로 직접 적용해야 한다
+# - 마이그레이션이 있는데 DB에 접속할 수 없으면 코드와 봇을 건드리지 않고 멈춘다
 # - 새 이미지를 먼저 빌드하고, 빌드가 실패하면 기존 봇을 그대로 둔다
 # - 재시작 후 봇이 시작됐는지 확인하고, 실패하면 로그와 되돌리는 방법을 보여 준다
 
@@ -82,6 +83,15 @@ if [ "$SCHEMA_APPLIED" = false ] && [ "${#migrations[@]}" -eq 0 ] && ! git diff 
     git diff "$before" "$after" -- db/schema.sql
     fail "db/schema.sql이 바뀌었습니다. 코드는 아직 업데이트하지 않았습니다.
   위 변경을 기존 DB에 직접 적용한 뒤 '$0 --schema-applied'로 다시 실행해 주세요."
+fi
+
+# 마이그레이션이 있으면 DB에 접속할 수 있는지 먼저 확인한다. 안 되면 코드도 봇도 건드리지 않고 멈춘다
+if [ "${#migrations[@]}" -gt 0 ]; then
+    timeout "$MIGRATE_TIMEOUT" "${DOCKER[@]}" compose exec -T db \
+        sh -c 'pg_isready -q -U "$POSTGRES_USER" -d "$POSTGRES_DB"' </dev/null ||
+        fail "DB에 접속할 수 없어 업데이트하지 않았습니다 (마이그레이션 필요). 코드와 봇은 그대로입니다.
+  DB 상태 확인: ${DOCKER[*]} compose ps -a db / ${DOCKER[*]} compose logs --tail 50 db
+  DB 시작(데이터 볼륨이 남아 있으면 그대로 씀. 확인: ${DOCKER[*]} volume ls | grep db-data): ${DOCKER[*]} compose up -d db"
 fi
 
 git merge --quiet --ff-only "origin/$BRANCH"
