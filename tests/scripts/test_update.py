@@ -26,9 +26,14 @@ case "$1 $2" in
     "compose up") [ "${FAKE_UP_FAILS:-0}" = 1 ] && exit 1 ;;
     "compose stop") [ "${FAKE_STOP_FAILS:-0}" = 1 ] && exit 1 ;;
     "compose exec")
+        # DB 접속 확인. FAKE_DB_DOWN이면 접속할 수 없다
+        if [[ "$*" == *pg_isready* ]]; then
+            [ "${FAKE_DB_DOWN:-0}" = 1 ] && exit 1
+            exit 0
+        fi
         # 마이그레이션은 표준 입력으로 받는다. 받은 SQL을 기록하고, FAKE_MIGRATE_FAIL_AT번째 적용을 실패시킨다
         cat >> "$DOCKER_CALLS.sql"
-        count=$(grep -c "^compose exec" "$DOCKER_CALLS")
+        count=$(grep -c "psql -q" "$DOCKER_CALLS")
         [ "$count" = "${FAKE_MIGRATE_FAIL_AT:-0}" ] && exit "${FAKE_MIGRATE_EXIT:-3}"
         ;;
 esac
@@ -363,3 +368,39 @@ def test_schema_change_with_only_modified_migration_stops(server: Server) -> Non
 
     assert result.returncode == 1
     assert "db/schema.sql이 바뀌었습니다" in result.stderr
+
+
+DB_CHECK_CALL = 'compose exec -T db sh -c pg_isready -q -U "$POSTGRES_USER" -d "$POSTGRES_DB"'
+
+
+def test_migration_checks_database_before_updating(server: Server) -> None:
+    server.push("db/migrations/20261119-01-create-a2.sql", "CREATE TABLE IF NOT EXISTS a2 ();\n", "feat: a2")
+
+    result = server.run()
+
+    assert result.returncode == 0, result.stderr
+    calls = server.docker_calls()
+    # 코드를 받고 빌드하기 전에 DB 접속을 확인한다
+    assert calls.index(DB_CHECK_CALL) < calls.index("compose build bot")
+
+
+def test_database_down_stops_without_touching_code_or_bot(server: Server) -> None:
+    server.push("db/migrations/20261119-01-create-a2.sql", "CREATE TABLE IF NOT EXISTS a2 ();\n", "feat: a2")
+
+    result = server.run(FAKE_DB_DOWN="1")
+
+    assert result.returncode == 1
+    assert "DB에 접속할 수 없어 업데이트하지 않았습니다" in result.stderr
+    assert "compose up -d db" in result.stderr
+    # 볼륨이 지워졌으면 빈 DB가 새로 만들어지므로, 시작하기 전에 볼륨을 확인하게 안내한다
+    assert "volume ls | grep db-data" in result.stderr
+    # 코드도 받지 않고, 빌드·봇 멈춤·마이그레이션도 하지 않는다 (실행 중인 봇은 그대로)
+    assert server.head() == "script"
+    assert [call for call in server.docker_calls() if call.startswith("compose")] == [DB_CHECK_CALL]
+
+
+def test_update_without_migration_does_not_check_database(server: Server) -> None:
+    server.push("src/app.py", "print(1)\n", "feat: 새 기능")
+
+    assert server.run(FAKE_DB_DOWN="1").returncode == 0
+    assert DB_CHECK_CALL not in server.docker_calls()
