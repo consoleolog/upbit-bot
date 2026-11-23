@@ -155,13 +155,15 @@ class LiveTrader:
             await self._executor.buy(market, market_id, amount)
 
     async def _add_buy(self, market: str, market_id: int, position: LivePosition) -> None:
-        """첫 매수 주문 금액 * add_buy_multiple만큼 추가 매수한다 (매매 로직 5.6, 6.1).
+        """첫 매수 또는 직전 매수 금액(설정 add_buy_base) * add_buy_multiple만큼 추가 매수한다 (매매 로직 5.6, 6.1).
 
         잔고가 그 금액(수수료 포함)보다 적거나, 최소·최대 주문 금액을 벗어나면 사지 않는다. 금액을 줄여서 사지 않는다.
         """
         async with self._buy_lock:
             chance = self._chances[market]
-            amount = (position.first_buy_amount * self._order.add_buy_multiple).to_integral_value(rounding=ROUND_DOWN)
+            # 첫 매수 금액의 몇 배인지로 계산해, 직전 매수 기준이어도 원 단위 내림이 쌓이지 않게 한다
+            units = self._order.add_buy_units(position.buy_count)
+            amount = (position.first_buy_amount * units).to_integral_value(rounding=ROUND_DOWN)
             minimum = min_buy_amount(chance)
             if not minimum <= amount <= chance.max_total:
                 logger.info(

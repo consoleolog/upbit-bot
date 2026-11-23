@@ -70,9 +70,9 @@ async def apply_paper_decision(
                 conn,
                 position_id=current.position_id,
                 average_price=paper_average_after_add(
-                    current.average_price, current.units, order_settings.add_buy_multiple, candle.close
+                    current.average_price, current.units, order_settings.add_buy_units(current.buy_count), candle.close
                 ),
-                units=order_settings.add_buy_multiple,
+                units=order_settings.add_buy_units(current.buy_count),
             )
             await IndicatorInfoRepository().clear_signal_states(conn, market_id)
             return PaperTrade(decision=decision, position=added)
