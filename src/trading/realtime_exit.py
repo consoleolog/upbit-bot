@@ -35,6 +35,10 @@ class RealtimeExit:
         self._latest: dict[str, Ticker] = {}
         self._pending: set[str] = set()
 
+    def latest_ticker(self, market: str) -> Ticker | None:
+        """마켓의 가장 최근 현재가. 아직 받지 못했으면 None. 상태 알림의 현재 수익률에 쓴다."""
+        return self._latest.get(market)
+
     def on_ticker(self, ticker: Ticker) -> None:
         """TickerFeed의 콜백. 최근 현재가를 기억하고, 그 마켓의 판단 작업이 기다리는 중이 아니면 새로 넘긴다."""
         market = ticker.market
