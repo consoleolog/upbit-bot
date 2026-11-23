@@ -1,5 +1,6 @@
+import asyncio
 import logging
-from collections.abc import Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Protocol
@@ -8,6 +9,7 @@ from src.app.application import Job
 from src.app.config import ExitSettings, OrderSettings, Timeframe
 from src.connections.database import Database
 from src.exchange.candle import Candle
+from src.exchange.retry import retry_read
 from src.repositories.indicator_info import IndicatorInfoRepository
 from src.repositories.models import IndicatorInfo, IndicatorType
 from src.trading.indicators import Indicators, IndicatorSettings, Line, calculate
@@ -45,8 +47,11 @@ class MarketWorker:
         market_ids: Mapping[str, int],
         order_settings: OrderSettings,
         live: LiveTrader | None = None,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
         self._upbit = upbit
+        # 캔들 조회를 다시 시도하기 전 대기
+        self._sleep = sleep
         self._database = database
         self._timeframe = timeframe
         self._indicator_settings = indicator_settings
@@ -70,8 +75,12 @@ class MarketWorker:
 
     async def on_candle_close(self, market: str, close: datetime) -> None:
         market_id = self._market_ids[market]
-        # 거래소 호출은 트랜잭션 밖에서 한다
-        candles = await self._upbit.get_candles(market, self._timeframe, close)
+        # 거래소 호출은 트랜잭션 밖에서 한다. 일시적인 실패(DNS 등)로 이번 마감의 판단을 놓치지 않게 다시 시도한다
+        candles = await retry_read(
+            lambda: self._upbit.get_candles(market, self._timeframe, close),
+            what=f"candle fetch (market={market})",
+            sleep=self._sleep,
+        )
         if not candles:
             logger.warning("no closed candles (market=%s, close=%s)", market, close.isoformat())
             return
