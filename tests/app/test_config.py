@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from src.app.config import ConfigError, ExitSettings, OrderSettings, Timeframe, TradingConfig, load_config
+from src.app.config import AddBuyBase, ConfigError, ExitSettings, OrderSettings, Timeframe, TradingConfig, load_config
 from src.trading.indicators import IndicatorSettings
 from src.trading.signals import SignalSettings, Threshold
 
@@ -228,7 +228,43 @@ def test_invalid_settings_rejected(tmp_path: Path, path: tuple[str, ...], value:
         load_config(_write(tmp_path, _with(path, value)))
 
 
+@pytest.mark.parametrize(("buy_count", "units"), [(1, "1.5"), (2, "2.25"), (3, "3.375")])
+def test_add_buy_units_grow_from_previous_buy(buy_count: int, units: str) -> None:
+    # 직전 매수 기준이면 직전 매수 금액의 add_buy_multiple배다
+    settings = OrderSettings(add_buy_multiple=Decimal("1.5"), add_buy_base=AddBuyBase.PREVIOUS)
+    assert settings.add_buy_units(buy_count) == Decimal(units)
+
+
+@pytest.mark.parametrize("buy_count", [1, 2, 3])
+def test_add_buy_units_from_first_buy_by_default(buy_count: int) -> None:
+    # 기본은 매번 첫 매수 금액의 add_buy_multiple배다
+    assert OrderSettings(add_buy_multiple=Decimal("1.5")).add_buy_units(buy_count) == Decimal("1.5")
+
+
+@pytest.mark.parametrize(("value", "expected"), [("first", AddBuyBase.FIRST), ("previous", AddBuyBase.PREVIOUS)])
+def test_add_buy_base_is_read(tmp_path: Path, value: str, expected: AddBuyBase) -> None:
+    config = load_config(_write(tmp_path, _with(("order", "add_buy_base"), value)))
+
+    assert config.order.add_buy_base is expected
+
+
+@pytest.mark.parametrize("value", ["last", "", 1, None])
+def test_invalid_add_buy_base_rejected(tmp_path: Path, value: object) -> None:
+    with pytest.raises(ConfigError, match=r"order\.add_buy_base"):
+        load_config(_write(tmp_path, _with(("order", "add_buy_base"), value)))
+
+
+def test_add_buy_units_needs_a_buy() -> None:
+    with pytest.raises(ValueError, match="buy_count"):
+        OrderSettings().add_buy_units(0)
+
+
 def test_repository_config_order() -> None:
-    # 매수는 원화 잔고의 20%, 추가 매수는 1.5배로 최대 2번
+    # 매수는 원화 잔고의 20%, 추가 매수는 첫 매수 금액의 1.5배로 최대 2번
     order = load_config(REPO_CONFIG).order
-    assert (order.buy_ratio, order.add_buy_multiple, order.max_add_buys) == (Decimal("20"), Decimal("1.5"), 2)
+    assert (order.buy_ratio, order.add_buy_multiple, order.max_add_buys, order.add_buy_base) == (
+        Decimal("20"),
+        Decimal("1.5"),
+        2,
+        AddBuyBase.FIRST,
+    )
