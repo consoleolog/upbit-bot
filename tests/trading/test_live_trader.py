@@ -10,7 +10,7 @@ from decimal import Decimal
 import pytest
 import pytest_asyncio
 
-from src.app.config import ExitSettings, OrderSettings
+from src.app.config import AddBuyBase, ExitSettings, OrderSettings
 from src.connections.database import Database
 from src.exchange.account import Account, OrderChance
 from src.exchange.candle import Candle
@@ -365,6 +365,26 @@ async def test_add_buy_is_first_amount_times_multiple(env: Env) -> None:
 
     assert env.executor.buys == [(env.market, Decimal("15000"))]
     assert env.executor.buy_reasons == [Reason.ADD]
+
+
+async def test_second_add_buy_is_first_amount_times_multiple_by_default(env: Env) -> None:
+    # 기본(첫 매수 기준)은 두 번째 추가 매수도 첫 매수 10,000원의 1.5배다
+    await env.hold(buys=2)
+
+    await env.candle("99000000")
+
+    assert env.executor.buys == [(env.market, Decimal("15000"))]
+
+
+async def test_second_add_buy_is_previous_amount_times_multiple(env: Env) -> None:
+    # 직전 매수 기준: 첫 매수 10,000원, 추가 매수 15,000원을 했다. 다음 추가 매수는 직전(15,000원)의 1.5배다
+    env.order = replace(env.order, add_buy_base=AddBuyBase.PREVIOUS)
+    env.trader = env.make_trader()
+    await env.hold(buys=2)
+
+    await env.candle("99000000")
+
+    assert env.executor.buys == [(env.market, Decimal("22500"))]
 
 
 async def test_no_add_buy_after_limit(env: Env) -> None:

@@ -34,17 +34,37 @@ class Timeframe(StrEnum):
         return timedelta(minutes=int(self.value.removesuffix("m")))
 
 
+class AddBuyBase(StrEnum):
+    """추가 매수 금액의 기준."""
+
+    FIRST = "first"  # 매번 첫 매수 금액 * add_buy_multiple
+    PREVIOUS = "previous"  # 직전 매수 금액 * add_buy_multiple (첫 매수의 1.5배, 2.25배, ...)
+
+
 @dataclass(frozen=True, kw_only=True)
 class OrderSettings:
     """주문 금액 (매매 로직 6.1). 매수 금액 = 원화 주문 가능 잔고 * buy_ratio / 100.
 
-    보유 중 매수 신호가 다시 나면 첫 매수 금액 * add_buy_multiple만큼 추가 매수하고, 최대 max_add_buys번까지 한다
-    (매매 로직 5.6). max_add_buys가 0이면 추가 매수하지 않는다.
+    보유 중 매수 신호가 다시 나면 add_buy_base 기준 금액 * add_buy_multiple만큼 추가 매수하고, 최대 max_add_buys번까지
+    한다 (매매 로직 5.6). max_add_buys가 0이면 추가 매수하지 않는다.
     """
 
     buy_ratio: Decimal = Decimal("10.0")
     add_buy_multiple: Decimal = Decimal("1.5")
     max_add_buys: int = 0
+    add_buy_base: AddBuyBase = AddBuyBase.FIRST
+
+    def add_buy_units(self, buy_count: int) -> Decimal:
+        """지금까지 buy_count번 샀을 때 다음 추가 매수 금액이 첫 매수 금액의 몇 배인지.
+
+        FIRST면 add_buy_multiple, PREVIOUS면 add_buy_multiple ** buy_count.
+        추가 매수는 금액을 줄여서 사지 않으므로, PREVIOUS의 직전 매수 금액은 항상 첫 매수 금액 * multiple ** (buy_count - 1)이다.
+        """
+        if buy_count < 1:
+            raise ValueError(f"buy_count must be at least 1: {buy_count}")
+        if self.add_buy_base is AddBuyBase.PREVIOUS:
+            return self.add_buy_multiple**buy_count
+        return self.add_buy_multiple
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -83,7 +103,7 @@ def load_config(path: Path) -> TradingConfig:
     root = _object(raw, "config", {"timeframe", "markets", "indicator", "threshold", "order", "exit", "live"})
     indicator = _object(root.get("indicator", {}), "indicator", {"ema", "macd_signal", "rsi", "stochastic"})
     threshold = _object(root.get("threshold", {}), "threshold", {"rsi", "stochastic", "stochastic_entry_max"})
-    order = _object(root.get("order", {}), "order", {"buy_ratio", "add_buy_multiple", "max_add_buys"})
+    order = _object(root.get("order", {}), "order", {"buy_ratio", "add_buy_multiple", "max_add_buys", "add_buy_base"})
     exit_ = _object(root.get("exit", {}), "exit", {"take_profit_rate", "stop_loss_rate", "min_profit_rate"})
     # 기간·기준의 범위와 순서는 각 설정 클래스가 만들 때 검증한다
     try:
@@ -209,7 +229,12 @@ def _parse_order(section: Mapping[str, object]) -> OrderSettings:
     max_add_buys = _integer(section, "max_add_buys", "order.max_add_buys", OrderSettings.max_add_buys)
     if max_add_buys < 0:
         raise ConfigError(f"order.max_add_buys must not be negative: {max_add_buys}")
-    return OrderSettings(buy_ratio=buy_ratio, add_buy_multiple=add_buy_multiple, max_add_buys=max_add_buys)
+    base = section.get("add_buy_base", OrderSettings.add_buy_base.value)
+    if base not in {b.value for b in AddBuyBase}:
+        raise ConfigError(f"order.add_buy_base must be one of {[b.value for b in AddBuyBase]}: {base!r}")
+    return OrderSettings(
+        buy_ratio=buy_ratio, add_buy_multiple=add_buy_multiple, max_add_buys=max_add_buys, add_buy_base=AddBuyBase(base)
+    )
 
 
 def _parse_exit(section: Mapping[str, object]) -> ExitSettings:

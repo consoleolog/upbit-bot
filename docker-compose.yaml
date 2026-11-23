@@ -29,6 +29,8 @@ services:
 
   bot:
     build: .
+    # 모의 실행 봇(paper-bot)도 이 이미지를 쓴다 (한 번만 빌드)
+    image: upbit-bot:latest
     restart: unless-stopped
     depends_on:
       db:
@@ -46,6 +48,31 @@ services:
       DISCORD_WEBHOOK_URL: ${DISCORD_WEBHOOK_URL:-}
     volumes:
       - ./config/trading.json:/app/config/trading.json:ro
+    logging: *logging
+
+  # 모의 실행 봇. .env에 COMPOSE_PROFILES=paper가 있을 때만 뜬다.
+  # 실거래 봇과 같은 PostgreSQL을 쓰되 DB는 따로(<DB_NAME>_paper) 쓴다. 같은 DB를 쓰면 마켓별 신호 상태가 섞인다.
+  # 모의 DB는 처음 한 번 scripts/init_paper_db.sh로 만든다. 업비트 키는 넘기지 않는다 (공개 시세만 쓴다)
+  paper-bot:
+    image: upbit-bot:latest
+    # 이미지는 bot이 빌드한다. 저장소에서 받으려 하지 않는다
+    pull_policy: never
+    profiles: ["paper"]
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    command: ["python", "-m", "src.main", "--config", "/app/config/trading.paper.json"]
+    environment:
+      DB_HOST: db
+      DB_PORT: "5432"
+      DB_NAME: ${DB_NAME}_paper
+      DB_USER: ${DB_USER}
+      DB_PASSWORD: ${DB_PASSWORD}
+      # 테스트 알림용 디스코드 웹훅. 없으면 알림을 보내지 않는다
+      DISCORD_WEBHOOK_URL: ${PAPER_DISCORD_WEBHOOK_URL:-}
+    volumes:
+      - ./config/trading.paper.json:/app/config/trading.paper.json:ro
     logging: *logging
 
 volumes:

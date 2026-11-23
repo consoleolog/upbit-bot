@@ -6,7 +6,7 @@ from decimal import Decimal
 import asyncpg
 import pytest
 
-from src.app.config import ExitSettings, OrderSettings
+from src.app.config import AddBuyBase, ExitSettings, OrderSettings
 from src.exchange.candle import Candle
 from src.exchange.ticker import Ticker
 from src.repositories.indicator_info import IndicatorInfoRepository
@@ -399,6 +399,24 @@ async def test_add_buy_stops_at_limit(conn: asyncpg.Connection) -> None:
     assert reasons == [Reason.ENTRY, Reason.ADD, Reason.ADD, None]
     position = await PaperPositionRepository().get_open(conn, market_id)
     assert position is not None and (position.buy_count, position.units) == (3, Decimal("4.0"))
+
+
+async def test_add_buys_grow_from_previous_buy(conn: asyncpg.Connection) -> None:
+    market_id = await _market_id(conn)
+    settings = replace(ADD_TWO, add_buy_base=AddBuyBase.PREVIOUS)
+    for i in range(3):
+        time = T0 + timedelta(minutes=30 * i)
+        await _apply(
+            conn,
+            market_id,
+            _candle(time, str(100 - i)),
+            await _save_states(conn, market_id, time, entry=True),
+            order_settings=settings,
+        )
+
+    # 매수 금액은 첫 매수의 1배, 1.5배, 2.25배 (직전 매수의 1.5배씩)
+    position = await PaperPositionRepository().get_open(conn, market_id)
+    assert position is not None and (position.buy_count, position.units) == (3, Decimal("4.75"))
 
 
 async def test_no_add_buy_when_disabled_or_window_short(conn: asyncpg.Connection) -> None:
