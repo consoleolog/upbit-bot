@@ -4,6 +4,7 @@ import logging
 import os
 import sys
 from collections.abc import Sequence
+from datetime import UTC, datetime
 from pathlib import Path
 
 from src.app.application import Application
@@ -21,6 +22,7 @@ from src.trading.live import LiveExecutor
 from src.trading.live_trader import LiveTrader
 from src.trading.market_worker import MarketWorker
 from src.trading.realtime_exit import RealtimeExit
+from src.trading.status_report import StatusReporter
 
 logger = logging.getLogger(__name__)
 
@@ -111,6 +113,20 @@ async def run(
             if executor is not None:
                 # 중단이 이어지는 동안 몇 시간마다 다시 알린다
                 app.add_service("halt-reminder", executor.remind_halts)
+            # 정해진 시각마다 상태를 알린다. 정상이어도 보내므로 오지 않으면 봇에 문제가 있다는 신호다
+            reporter = StatusReporter(
+                database=database,
+                market_ids=market_ids,
+                prices=realtime_exit.latest_ticker,
+                notifier=notifier,
+                submit=app.submit,
+                stochastic_entry_max=config.stochastic_entry_max,
+                started_at=datetime.now(UTC),
+                balance=upbit if config.live else None,
+                halts=executor,
+                clock=lambda: datetime.now(UTC),
+            )
+            app.add_service("status-report", reporter.run)
             started = f"[봇 시작] {'실거래' if config.live else '모의 실행'} · {', '.join(config.markets)} · {config.timeframe}"
             halted = "".join(f"\n🚨 매매 중단 중: {market} ({halt.reason})" for market, halt in halts.items())
             notifier.notify(started + halted)
