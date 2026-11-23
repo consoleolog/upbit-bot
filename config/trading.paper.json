@@ -1,6 +1,6 @@
 {
   "live": false,
-  "timeframe": "30m",
+  "timeframe": "15m",
   "markets": ["KRW-BTC", "KRW-ETH", "KRW-BCH", "KRW-SOL", "KRW-AAVE", "KRW-BSV", "KRW-ENS"],
   "indicator": {
     "ema": { "short": 5, "mid": 8, "long": 13 },
