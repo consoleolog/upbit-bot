@@ -6,7 +6,7 @@ import pytest
 
 from src.app.config import ExitSettings
 from src.repositories.models import IndicatorInfo, IndicatorType
-from src.trading.decision import Action, Decision, Holding, Reason, decide, net_profit_rate
+from src.trading.decision import Action, Decision, Holding, Reason, decide, entry_conditions, net_profit_rate
 from src.trading.signals import CrossState, OverState
 
 T0 = datetime(2026, 1, 1, tzinfo=UTC)
@@ -342,3 +342,40 @@ def test_stop_loss_comes_before_add_buy() -> None:
     assert _decide_holding(_entry_states(), "96.9", can_add=True) == Decision(
         action=Action.SELL, reason=Reason.STOP_LOSS
     )
+
+
+# ---------------------------------------------------------------------------
+# 매수 조건 하나씩 (상태 알림에 쓴다)
+# ---------------------------------------------------------------------------
+
+
+def test_entry_conditions_all_true_when_buy() -> None:
+    assert entry_conditions(_entry_states(), 50.0) == (True,) * 9
+
+
+def test_entry_conditions_without_states_all_false() -> None:
+    assert entry_conditions({}, 50.0) == (False,) * 9
+
+
+@pytest.mark.parametrize(
+    ("change", "index"),
+    [
+        (lambda s: s | {IndicatorType.RSI: replace(s[IndicatorType.RSI], over_state=None)}, 0),
+        (lambda s: s | {IndicatorType.RSI: replace(s[IndicatorType.RSI], cross_state=CrossState.DEAD_CROSS)}, 1),
+        (lambda s: s | {IndicatorType.STOCHASTIC: replace(s[IndicatorType.STOCHASTIC], over_state=None)}, 2),
+        (lambda s: s | {IndicatorType.STOCHASTIC: replace(s[IndicatorType.STOCHASTIC], cross_state=None)}, 3),
+        (lambda s: s | {IndicatorType.MACD_SHORT: replace(s[IndicatorType.MACD_SHORT], cross_state=None)}, 4),
+        (lambda s: s | {IndicatorType.MACD_MID: replace(s[IndicatorType.MACD_MID], cross_state=None)}, 5),
+        (lambda s: s | {IndicatorType.MACD_LONG: replace(s[IndicatorType.MACD_LONG], cross_state=None)}, 6),
+        (lambda s: s | {IndicatorType.STOCHASTIC: replace(s[IndicatorType.STOCHASTIC], value=50.1)}, 7),
+        (lambda s: s | {IndicatorType.STOCHASTIC: replace(s[IndicatorType.STOCHASTIC], signal=None)}, 8),
+    ],
+)
+def test_each_entry_condition_is_counted_and_blocks_buy(change: object, index: int) -> None:
+    states = change(_entry_states())  # type: ignore[operator]
+
+    conditions = entry_conditions(states, 50.0)
+
+    # 바꾼 조건 하나만 거짓이고, 그 하나 때문에 매수하지 않는다
+    assert [i for i, ok in enumerate(conditions) if not ok] == [index]
+    assert _decide(states) is None

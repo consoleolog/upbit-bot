@@ -87,6 +87,10 @@ class LiveExecutor:
     def is_halted(self, market: str) -> bool:
         return market in self._halted
 
+    def halted_markets(self) -> list[str]:
+        """매매가 중단된 마켓 (이름 순서). 상태 알림에 쓴다."""
+        return sorted(self._halted)
+
     async def remind_halts(self, interval: timedelta = HALT_REMIND_INTERVAL) -> None:
         """중단된 마켓이 있으면 interval마다 다시 알린다. 애플리케이션의 서비스로 실행한다 (취소될 때까지)."""
         while True:

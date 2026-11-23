@@ -86,24 +86,33 @@ def decide(
     return None
 
 
+def entry_conditions(states: Mapping[IndicatorType, IndicatorInfo], stochastic_entry_max: float) -> tuple[bool, ...]:
+    """신규·추가 매수 9개 조건 각각의 충족 여부 (매매 로직 5.6). 9개가 모두 참이어야 매수한다.
+
+    순서: RSI 과매도, RSI 골든크로스, 스토캐스틱 과매도, 스토캐스틱 골든크로스, MACD 단기·중기·장기 골든크로스,
+    %K 기준 이하, %D 기준 이하. 상태 알림에서 몇 개가 충족됐는지 보여 줄 때도 이 함수를 쓴다.
+    """
+    golden = CrossState.GOLDEN_CROSS
+    stochastic = states.get(IndicatorType.STOCHASTIC)
+    # 현재 %K, %D가 기준 이하여야 한다 (반등 초기인지 확인). 값이 없으면 충족하지 않은 것으로 본다
+    k = None if stochastic is None else stochastic.value
+    d = None if stochastic is None else stochastic.signal
+    return (
+        _over(states, IndicatorType.RSI, OverState.OVER_SOLD),
+        _cross(states, IndicatorType.RSI, golden),
+        _over(states, IndicatorType.STOCHASTIC, OverState.OVER_SOLD),
+        _cross(states, IndicatorType.STOCHASTIC, golden),
+        _cross(states, IndicatorType.MACD_SHORT, golden),
+        _cross(states, IndicatorType.MACD_MID, golden),
+        _cross(states, IndicatorType.MACD_LONG, golden),
+        k is not None and k <= stochastic_entry_max,
+        d is not None and d <= stochastic_entry_max,
+    )
+
+
 def _entry(states: Mapping[IndicatorType, IndicatorInfo], stochastic_entry_max: float) -> bool:
     """신규 매수 9개 조건이 모두 참인지 (매매 로직 5.6)."""
-    stochastic = states.get(IndicatorType.STOCHASTIC)
-    # 현재 %K, %D가 기준 이하여야 한다 (반등 초기인지 확인). 값이 없으면 판단하지 않는다
-    if stochastic is None or stochastic.value is None or stochastic.signal is None:
-        return False
-    if stochastic.value > stochastic_entry_max or stochastic.signal > stochastic_entry_max:
-        return False
-    golden = CrossState.GOLDEN_CROSS
-    return (
-        _over(states, IndicatorType.RSI, OverState.OVER_SOLD)
-        and _cross(states, IndicatorType.RSI, golden)
-        and _over(states, IndicatorType.STOCHASTIC, OverState.OVER_SOLD)
-        and _cross(states, IndicatorType.STOCHASTIC, golden)
-        and _cross(states, IndicatorType.MACD_SHORT, golden)
-        and _cross(states, IndicatorType.MACD_MID, golden)
-        and _cross(states, IndicatorType.MACD_LONG, golden)
-    )
+    return all(entry_conditions(states, stochastic_entry_max))
 
 
 def _over(states: Mapping[IndicatorType, IndicatorInfo], indicator_type: IndicatorType, state: OverState) -> bool:

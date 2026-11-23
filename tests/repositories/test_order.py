@@ -1,5 +1,6 @@
 import uuid
 from dataclasses import replace
+from datetime import datetime, timedelta
 from decimal import Decimal
 
 import asyncpg
@@ -224,3 +225,31 @@ async def test_buy_with_sell_reason_rejected(conn: asyncpg.Connection, reason: R
         await repo.create_buy(conn, market_id=market_id, amount=Decimal("5000"), reason=reason)
 
     assert await repo.get_unfinished(conn, market_id) is None
+
+
+async def test_count_filled_since(conn: asyncpg.Connection) -> None:
+    first, second, other = await _market_id(conn), await _market_id(conn), await _market_id(conn)
+    await _finish(conn, await _buy(conn, first), LiveOrderState.DONE)
+    await _finish(conn, await _buy(conn, second), LiveOrderState.CANCEL)
+    await _finish(conn, await _buy(conn, other), LiveOrderState.DONE)
+    # 체결 없이 끝났거나 끝나지 않은 주문은 세지 않는다
+    unfilled = await _market_id(conn)
+    await repo.record_result(
+        conn,
+        order_id=(await _buy(conn, unfilled)).order_id,
+        state=LiveOrderState.CANCEL,
+        executed_volume=Decimal(0),
+        executed_funds=Decimal(0),
+        paid_fee=Decimal(0),
+    )
+    await _buy(conn, await _market_id(conn))
+    started = await conn.fetchval("SELECT now()")
+
+    assert await repo.count_filled_since(conn, started, [first, second, unfilled]) == 2
+    # 그 뒤에 기록한 주문만 센다
+    assert await repo.count_filled_since(conn, started + timedelta(seconds=1), [first, second]) == 0
+
+
+async def test_count_filled_since_rejects_naive_time(conn: asyncpg.Connection) -> None:
+    with pytest.raises(ValueError, match="since"):
+        await repo.count_filled_since(conn, datetime(2026, 1, 1), [1])
