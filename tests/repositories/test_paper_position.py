@@ -213,3 +213,30 @@ async def test_unusable_paper_add_buy_not_recorded(conn: asyncpg.Connection, fie
         await repo.add_buy(conn, position_id=position_id, **{**add, field: Decimal(value)})
 
     assert await repo.get_open(conn, market_id) == before
+
+
+async def test_list_open_and_closed_since(conn: asyncpg.Connection) -> None:
+    held, sold_early, sold_late = await _market_id(conn), await _market_id(conn), await _market_id(conn)
+    holding = await _open(conn, held)
+    for market_id, exit_time in ((sold_early, T1), (sold_late, T1 + timedelta(hours=1))):
+        await repo.close(
+            conn,
+            position_id=await _open(conn, market_id),
+            exit_time=exit_time,
+            exit_price=Decimal("102"),
+            exit_reason=Reason.TAKE_PROFIT,
+            net_profit_rate=Decimal("1.8"),
+        )
+    mine = {held, sold_early, sold_late}
+
+    assert [p.position_id for p in await repo.list_open(conn) if p.market_id in mine] == [holding]
+    closed = [
+        p.market_id for p in await repo.list_closed_since(conn, T1 + timedelta(minutes=30)) if p.market_id in mine
+    ]
+    assert closed == [sold_late]
+    assert sold_early in [p.market_id for p in await repo.list_closed_since(conn, T1)]
+
+
+async def test_list_closed_since_rejects_naive_time(conn: asyncpg.Connection) -> None:
+    with pytest.raises(ValueError, match="since"):
+        await repo.list_closed_since(conn, datetime(2026, 1, 1))

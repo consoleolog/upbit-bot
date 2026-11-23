@@ -16,6 +16,19 @@ class PositionRepository:
         row = await conn.fetchrow("SELECT * FROM position WHERE market_id = $1 AND status = 'OPEN'", market_id)
         return None if row is None else LivePosition.from_record(row)
 
+    async def list_open(self, conn: asyncpg.Connection) -> list[LivePosition]:
+        """모든 마켓의 열린 실거래 포지션 (연 순서)."""
+        rows = await conn.fetch("SELECT * FROM position WHERE status = 'OPEN' ORDER BY opened_at, position_id")
+        return [LivePosition.from_record(row) for row in rows]
+
+    async def list_closed_since(self, conn: asyncpg.Connection, since: datetime) -> list[LivePosition]:
+        """since 이후(포함)에 닫힌 실거래 포지션 (닫힌 순서)."""
+        check_aware("since", since)
+        rows = await conn.fetch(
+            "SELECT * FROM position WHERE status = 'CLOSED' AND closed_at >= $1 ORDER BY closed_at, position_id", since
+        )
+        return [LivePosition.from_record(row) for row in rows]
+
     async def open(
         self,
         conn: asyncpg.Connection,
