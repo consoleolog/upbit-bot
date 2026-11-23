@@ -159,3 +159,18 @@ async def test_live_checks_live_position_instead_of_paper(mocker: MockerFixture)
     # 실거래는 거래소를 호출하므로 여기서 트랜잭션을 열지 않고 실거래 판단에 넘긴다
     live.on_ticker.assert_awaited_once_with("KRW-BTC", 1, _ticker("98"))
     database.transaction.assert_not_called()
+
+
+def test_latest_ticker_is_remembered_per_market() -> None:
+    realtime = _exit(Submitted())
+
+    assert realtime.latest_ticker("KRW-BTC") is None
+    realtime.on_ticker(_ticker("100"))
+    realtime.on_ticker(_ticker("101", seconds=2))
+    realtime.on_ticker(_ticker("200", market="KRW-ETH"))
+
+    # 상태 알림은 마켓별 가장 최근 현재가로 수익률을 계산한다
+    latest = realtime.latest_ticker("KRW-BTC")
+    assert latest is not None and latest.price == Decimal("101")
+    eth = realtime.latest_ticker("KRW-ETH")
+    assert eth is not None and eth.price == Decimal("200")
