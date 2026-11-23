@@ -226,3 +226,9 @@ def _with(path: tuple[str, ...], value: object) -> dict[str, object]:
 def test_invalid_settings_rejected(tmp_path: Path, path: tuple[str, ...], value: object, message: str) -> None:
     with pytest.raises(ConfigError, match=message):
         load_config(_write(tmp_path, _with(path, value)))
+
+
+def test_repository_config_order() -> None:
+    # 매수는 원화 잔고의 20%, 추가 매수는 1.5배로 최대 2번
+    order = load_config(REPO_CONFIG).order
+    assert (order.buy_ratio, order.add_buy_multiple, order.max_add_buys) == (Decimal("20"), Decimal("1.5"), 2)
