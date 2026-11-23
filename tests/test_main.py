@@ -1,8 +1,10 @@
+import logging
 import uuid
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 
+import httpx
 import pytest
 from pytest_mock import MockerFixture
 
@@ -13,7 +15,16 @@ from src.connections.database import Database, DatabaseConfig
 from src.exchange.account import Account, OrderChance
 from src.exchange.upbit_auth import UpbitCredentials
 from src.exchange.upbit_client import UpbitAuthError
-from src.main import EXIT_OK, EXIT_STARTUP_FAILED, StartupError, main, parse_args, register_markets, run
+from src.main import (
+    EXIT_OK,
+    EXIT_STARTUP_FAILED,
+    StartupError,
+    configure_logging,
+    main,
+    parse_args,
+    register_markets,
+    run,
+)
 from src.repositories.models import MarketHalt
 from src.trading.indicators import IndicatorSettings
 from src.trading.signals import SignalSettings, Threshold
@@ -439,3 +450,21 @@ async def test_paper_run_does_not_load_halts(mocker: MockerFixture) -> None:
     await run(Path("config.json"), TradingConfig(timeframe=Timeframe.MINUTE_30, markets=("KRW-BTC",)), DB_CONFIG)
 
     stubs["halts"].assert_not_awaited()  # type: ignore[attr-defined]
+
+
+async def test_logging_does_not_expose_request_urls(caplog: pytest.LogCaptureFixture) -> None:
+    configure_logging()
+    caplog.set_level(logging.INFO)
+    sent: list[httpx.Request] = []
+
+    def discord(request: httpx.Request) -> httpx.Response:
+        sent.append(request)
+        return httpx.Response(204)
+
+    notifier = DiscordNotifier(WEBHOOK, transport=httpx.MockTransport(discord))
+
+    await notifier.send_now("알림")
+
+    # 웹훅 URL(토큰 포함)은 httpx의 요청 로그로도 남지 않는다
+    assert len(sent) == 1
+    assert "secret" not in caplog.text

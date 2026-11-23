@@ -163,8 +163,18 @@ async def register_markets(database: Database, markets: Sequence[str]) -> dict[s
         return {market: (await repo.get_by_symbol(conn, market)).market_id for market in markets}
 
 
-def main(argv: Sequence[str] | None = None) -> int:
+def configure_logging() -> None:
+    """로그 설정. httpx·httpcore는 요청마다 전체 URL을 INFO로 남기므로 경고 이상만 남긴다.
+
+    디스코드 웹훅 URL에는 토큰이 들어 있어 URL 자체가 비밀값이다 (로그에 남기지 않음).
+    """
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    for name in ("httpx", "httpcore"):
+        logging.getLogger(name).setLevel(logging.WARNING)
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    configure_logging()
     args = parse_args(argv)
 
     # 잘못된 설정은 매매를 시작하기 전에 막는다
