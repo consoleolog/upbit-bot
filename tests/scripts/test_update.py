@@ -25,15 +25,22 @@ case "$1 $2" in
         ;;
     "compose up") [ "${FAKE_UP_FAILS:-0}" = 1 ] && exit 1 ;;
     "compose stop") [ "${FAKE_STOP_FAILS:-0}" = 1 ] && exit 1 ;;
+    "compose config") printf '%b\n' "${FAKE_SERVICES-db\nbot}" ;;
     "compose exec")
         # DB 접속 확인. FAKE_DB_DOWN이면 접속할 수 없다
         if [[ "$*" == *pg_isready* ]]; then
             [ "${FAKE_DB_DOWN:-0}" = 1 ] && exit 1
             exit 0
         fi
+        # 모의 DB 마이그레이션. FAKE_PAPER_MIGRATE_FAILS면 실패한다
+        if [[ "$*" == *_paper* ]]; then
+            cat >> "$DOCKER_CALLS.paper_sql"
+            [ "${FAKE_PAPER_MIGRATE_FAILS:-0}" = 1 ] && exit 3
+            exit 0
+        fi
         # 마이그레이션은 표준 입력으로 받는다. 받은 SQL을 기록하고, FAKE_MIGRATE_FAIL_AT번째 적용을 실패시킨다
         cat >> "$DOCKER_CALLS.sql"
-        count=$(grep -c "psql -q" "$DOCKER_CALLS")
+        count=$(grep "psql -q" "$DOCKER_CALLS" | grep -vc _paper)
         [ "$count" = "${FAKE_MIGRATE_FAIL_AT:-0}" ] && exit "${FAKE_MIGRATE_EXIT:-3}"
         ;;
 esac
@@ -96,6 +103,10 @@ class Server:
 
     def docker_calls(self) -> list[str]:
         return self.calls.read_text(encoding="utf-8").splitlines()
+
+    def _read(self, suffix: str) -> str:
+        path = self.calls.with_name(self.calls.name + suffix)
+        return path.read_text(encoding="utf-8") if path.exists() else ""
 
     def applied_sql(self) -> str:
         path = self.calls.with_name(self.calls.name + ".sql")
@@ -404,3 +415,58 @@ def test_update_without_migration_does_not_check_database(server: Server) -> Non
 
     assert server.run(FAKE_DB_DOWN="1").returncode == 0
     assert DB_CHECK_CALL not in server.docker_calls()
+
+
+PAPER_MIGRATE_CALL = (
+    "compose exec -T db sh -c psql -q -v ON_ERROR_STOP=1 --single-transaction "
+    '-U "$POSTGRES_USER" -d "${POSTGRES_DB}_paper"'
+)
+PAPER = {"FAKE_SERVICES": "db\\nbot\\npaper-bot"}
+
+
+def test_paper_db_gets_same_migrations_before_restart(server: Server) -> None:
+    server.push("db/migrations/20261119-01-create-a2.sql", "CREATE TABLE IF NOT EXISTS a2 ();\n", "feat: a2")
+
+    result = server.run(**PAPER)
+
+    assert result.returncode == 0, result.stderr
+    assert server._read(".paper_sql") == "CREATE TABLE IF NOT EXISTS a2 ();\n"
+    calls = server.docker_calls()
+    # 실거래 DB → 모의 봇 멈춤 → 모의 DB → 모두 시작
+    assert (
+        calls.index(MIGRATE_CALL)
+        < calls.index("compose stop paper-bot")
+        < calls.index(PAPER_MIGRATE_CALL)
+        < calls.index("compose up -d")
+    )
+
+
+def test_paper_migration_failure_does_not_block_live_update(server: Server) -> None:
+    server.push("db/migrations/20261119-01-create-a2.sql", "CREATE TABLE IF NOT EXISTS a2 ();\n", "feat: a2")
+
+    result = server.run(FAKE_PAPER_MIGRATE_FAILS="1", **PAPER)
+
+    # 실거래 봇은 업데이트하고, 모의 봇은 바뀐 코드가 옛 스키마로 돌지 않게 시작하지 않는다
+    assert result.returncode == 0, result.stderr
+    assert "모의 DB 마이그레이션" in result.stderr and "init_paper_db.sh" in result.stderr
+    assert server.head() == "feat: a2"
+    assert "compose up -d db bot" in server.docker_calls()
+
+
+def test_paper_not_used_skips_paper_migration(server: Server) -> None:
+    server.push("db/migrations/20261119-01-create-a2.sql", "CREATE TABLE IF NOT EXISTS a2 ();\n", "feat: a2")
+
+    assert server.run().returncode == 0
+    calls = server.docker_calls()
+    assert PAPER_MIGRATE_CALL not in calls
+    assert "compose stop paper-bot" not in calls
+
+
+def test_update_without_migration_does_not_touch_paper_db(server: Server) -> None:
+    server.push("src/app.py", "print(1)\n", "feat: 새 기능")
+
+    assert server.run(**PAPER).returncode == 0
+    calls = server.docker_calls()
+    assert PAPER_MIGRATE_CALL not in calls
+    # 모의 봇도 함께 새 이미지로 다시 시작한다
+    assert "compose up -d" in calls
