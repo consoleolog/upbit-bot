@@ -721,3 +721,12 @@ async def test_remind_halts_repeats_halted_markets(env: Env) -> None:
     reminder = env.notifier.messages[1]
     assert reminder.startswith("🚨 [매매 중단 중] 확인이 필요합니다.")
     assert f"\n{env.market} · 11-19 12:30부터 · order rejected (400 insufficient_funds_bid)" in reminder
+
+
+async def test_halted_markets_are_listed(env: Env) -> None:
+    assert env.executor.halted_markets() == []
+    env.upbit.place_error = REJECTED
+
+    await env.executor.buy(env.market, env.market_id, Decimal("5000"))
+
+    assert env.executor.halted_markets() == [env.market]
