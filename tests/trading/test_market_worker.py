@@ -11,6 +11,7 @@ from pytest_mock import MockerFixture
 from src.app.config import ExitSettings, OrderSettings, Timeframe
 from src.connections.database import Database
 from src.exchange.candle import Candle
+from src.exchange.upbit_client import UpbitConnectionError
 from src.repositories.indicator_info import IndicatorInfoRepository
 from src.repositories.market import MarketRepository
 from src.repositories.models import IndicatorInfo, IndicatorType
@@ -342,8 +343,15 @@ def test_replay_already_processed_does_nothing(offset: int) -> None:
     assert (result.infos, result.judged, result.reset) == ((), 0, False)
 
 
-def _worker(upbit: FakeUpbit, database: Database, market_ids: dict[str, int]) -> MarketWorker:
+def _worker(
+    upbit: FakeUpbit, database: Database, market_ids: dict[str, int], sleeps: list[float] | None = None
+) -> MarketWorker:
+    async def sleep(seconds: float) -> None:
+        if sleeps is not None:
+            sleeps.append(seconds)
+
     return MarketWorker(
+        sleep=sleep,
         upbit=upbit,
         database=database,
         timeframe=Timeframe.MINUTE_30,
@@ -363,6 +371,46 @@ async def test_no_candles_does_not_touch_database(caplog: pytest.LogCaptureFixtu
 
     database.transaction.assert_not_called()
     assert "no closed candles" in caplog.text
+
+
+class FlakyUpbit(FakeUpbit):
+    """정해 둔 횟수만큼 연결에 실패한 뒤 캔들을 돌려준다."""
+
+    def __init__(self, candles: list[Candle], failures: int) -> None:
+        super().__init__(candles)
+        self.failures = failures
+
+    async def get_candles(self, market: str, timeframe: Timeframe, to: datetime) -> list[Candle]:
+        self.calls.append((market, timeframe, to))
+        if self.failures:
+            self.failures -= 1
+            raise UpbitConnectionError("GET /v1/candles/minutes/30 failed to connect: ConnectError")
+        return self.candles
+
+
+async def test_candle_fetch_is_retried_after_connection_failure(caplog: pytest.LogCaptureFixture) -> None:
+    # DNS 조회 실패 같은 일시적인 연결 실패로 이번 마감의 판단을 놓치지 않는다
+    upbit = FlakyUpbit([], failures=2)
+    sleeps: list[float] = []
+
+    await _worker(upbit, MagicMock(), {"KRW-BTC": 1}, sleeps).candle_close_job("KRW-BTC", T1)()
+
+    assert len(upbit.calls) == 3
+    assert sleeps == [1.0, 2.0]
+    assert "candle fetch (market=KRW-BTC) failed (UpbitConnectionError)" in caplog.text
+    assert "no closed candles" in caplog.text
+
+
+async def test_candle_fetch_gives_up_after_retries() -> None:
+    upbit = FlakyUpbit([], failures=3)
+    database = MagicMock()
+
+    # 계속 실패하면 작업이 실패한다 (애플리케이션이 기록하고, 다음 마감에서 놓친 캔들까지 처리한다)
+    with pytest.raises(UpbitConnectionError):
+        await _worker(upbit, database, {"KRW-BTC": 1}, []).candle_close_job("KRW-BTC", T1)()
+
+    assert len(upbit.calls) == 3
+    database.transaction.assert_not_called()
 
 
 async def test_unknown_market_fails_before_fetching() -> None:
