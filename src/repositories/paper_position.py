@@ -6,7 +6,7 @@ import asyncpg
 from src.app.config import ExitSettings
 from src.repositories.errors import NotFoundError
 from src.repositories.models import PaperPosition
-from src.repositories.values import check_decimal
+from src.repositories.values import check_aware, check_decimal
 from src.trading.reasons import Reason
 
 
@@ -15,6 +15,20 @@ class PaperPositionRepository:
         """마켓의 열린 모의 포지션. 없으면 None."""
         row = await conn.fetchrow("SELECT * FROM paper_position WHERE market_id = $1 AND status = 'OPEN'", market_id)
         return None if row is None else PaperPosition.from_record(row)
+
+    async def list_open(self, conn: asyncpg.Connection) -> list[PaperPosition]:
+        """모든 마켓의 열린 모의 포지션 (매수 순서)."""
+        rows = await conn.fetch("SELECT * FROM paper_position WHERE status = 'OPEN' ORDER BY entry_time, position_id")
+        return [PaperPosition.from_record(row) for row in rows]
+
+    async def list_closed_since(self, conn: asyncpg.Connection, since: datetime) -> list[PaperPosition]:
+        """매도를 판단한 시각(exit_time)이 since 이후(포함)인 모의 포지션 (닫힌 순서)."""
+        check_aware("since", since)
+        rows = await conn.fetch(
+            "SELECT * FROM paper_position WHERE status = 'CLOSED' AND exit_time >= $1 ORDER BY exit_time, position_id",
+            since,
+        )
+        return [PaperPosition.from_record(row) for row in rows]
 
     async def open(
         self,

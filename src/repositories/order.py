@@ -1,3 +1,5 @@
+from collections.abc import Sequence
+from datetime import datetime
 from decimal import Decimal
 
 import asyncpg
@@ -5,7 +7,7 @@ import asyncpg
 from src.exchange.order import OrderSide
 from src.repositories.errors import NotFoundError
 from src.repositories.models import LiveOrder, LiveOrderState
-from src.repositories.values import check_decimal
+from src.repositories.values import check_aware, check_decimal
 from src.trading.reasons import Reason
 
 # 마켓당 끝나지 않은 주문은 하나다 (orders_unfinished_market 인덱스). 이미 있으면 기록하지 않는다
@@ -38,6 +40,22 @@ class OrderRepository:
         check_decimal("volume", volume, positive=True)
         row = await conn.fetchrow(_INSERT, market_id, OrderSide.ASK, reason, None, volume)
         return None if row is None else LiveOrder.from_record(row)
+
+    async def count_filled_since(self, conn: asyncpg.Connection, since: datetime, market_ids: Sequence[int]) -> int:
+        """market_ids 마켓에서 since 이후(포함)에 기록한 주문 중 체결이 있는 끝난 주문 수.
+
+        시장가 주문은 기록 직후 체결되므로 기록 시각으로 센다.
+        """
+        check_aware("since", since)
+        return await conn.fetchval(
+            """
+            SELECT count(*) FROM orders
+            WHERE market_id = ANY($2::int[]) AND created_at >= $1
+              AND state IN ('done', 'cancel') AND executed_volume > 0
+            """,
+            since,
+            list(market_ids),
+        )
 
     async def get_unfinished(self, conn: asyncpg.Connection, market_id: int) -> LiveOrder | None:
         """마켓의 끝나지 않은 주문(pending, wait). 없으면 None."""

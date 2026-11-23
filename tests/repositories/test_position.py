@@ -265,3 +265,26 @@ async def test_unusable_first_buy_amount_not_recorded(conn: asyncpg.Connection, 
             exit_settings=EXIT,
             first_buy_amount=Decimal(value),
         )
+
+
+async def test_list_open_and_closed_since(conn: asyncpg.Connection) -> None:
+    held, sold_early, sold_late = await _market_id(conn), await _market_id(conn), await _market_id(conn)
+    holding = await _open(conn, held)
+    for market_id, closed_at in ((sold_early, T1), (sold_late, T1 + timedelta(hours=1))):
+        position = await _open(conn, market_id)
+        await repo.add_sell(conn, position_id=position.position_id, volume=Decimal("0.001"), proceeds=Decimal("5000"))
+        await repo.close(conn, position_id=position.position_id, closed_at=closed_at, exit_reason=Reason.TAKE_PROFIT)
+    mine = {held, sold_early, sold_late}
+
+    assert [p.position_id for p in await repo.list_open(conn) if p.market_id in mine] == [holding.position_id]
+    closed = [
+        p.market_id for p in await repo.list_closed_since(conn, T1 + timedelta(minutes=30)) if p.market_id in mine
+    ]
+    assert closed == [sold_late]
+    # 경계 시각에 닫힌 것도 포함한다
+    assert sold_early in [p.market_id for p in await repo.list_closed_since(conn, T1)]
+
+
+async def test_list_closed_since_rejects_naive_time(conn: asyncpg.Connection) -> None:
+    with pytest.raises(ValueError, match="since"):
+        await repo.list_closed_since(conn, datetime(2026, 1, 1))
