@@ -1,4 +1,5 @@
 import json
+from dataclasses import replace
 from datetime import timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -267,4 +268,31 @@ def test_repository_config_order() -> None:
         Decimal("1.5"),
         2,
         AddBuyBase.FIRST,
+    )
+
+
+PAPER_CONFIG = REPO_CONFIG.with_name("trading.paper.json")
+
+
+def test_paper_config_is_paper_with_more_markets_and_previous_add_buy() -> None:
+    paper = load_config(PAPER_CONFIG)
+
+    # 모의 실행 봇의 설정은 실거래로 바뀌지 않는다 (prod에서도 모의 실행)
+    assert paper.live is False
+    assert paper.markets == ("KRW-BTC", "KRW-ETH", "KRW-BCH", "KRW-SOL", "KRW-AAVE", "KRW-BSV", "KRW-ENS")
+    assert paper.order.add_buy_base is AddBuyBase.PREVIOUS
+
+
+def test_paper_config_differs_from_live_only_in_markets_and_add_buy() -> None:
+    paper, live = load_config(PAPER_CONFIG), load_config(REPO_CONFIG)
+
+    # 마켓과 추가 매수 기준만 다르다. 그 밖의 매매 기준은 실거래와 같아야 비교 시험이 된다
+    assert (
+        replace(
+            paper,
+            markets=live.markets,
+            live=live.live,
+            order=replace(paper.order, add_buy_base=live.order.add_buy_base),
+        )
+        == live
     )
