@@ -15,6 +15,7 @@
 # - db/schema.sql이 바뀌었는데 새 마이그레이션이 없으면 멈춘다. 기존 DB에는 schema.sql이 자동으로 적용되지 않으므로 직접 적용해야 한다
 # - 마이그레이션이 있는데 DB에 접속할 수 없으면 코드와 봇을 건드리지 않고 멈춘다
 # - 모의 실행 봇을 쓰면(COMPOSE_PROFILES=paper) 모의 DB에도 마이그레이션을 적용한다. 실패해도 실거래 배포는 계속한다
+# - 봇 컨테이너는 배포마다 다시 만든다 (설정 파일만 바뀌어도 반영되게)
 # - 새 이미지를 먼저 빌드하고, 빌드가 실패하면 기존 봇을 그대로 둔다
 # - 재시작 후 봇이 시작됐는지 확인하고, 실패하면 로그와 되돌리는 방법을 보여 준다
 
@@ -137,8 +138,14 @@ fi
 
 # 모의 실행 봇(.env의 COMPOSE_PROFILES=paper)을 쓰면 모의 DB(<DB_NAME>_paper)에도 같은 마이그레이션을 적용한다.
 # 모의 쪽 실패는 실거래 배포를 막지 않는다. 경고만 남기고 모의 봇은 멈춘 채로 둔다 (바뀐 코드가 옛 스키마로 돌지 않게)
-up_services=()
-if [ "${#migrations[@]}" -gt 0 ] && "${DOCKER[@]}" compose config --services 2>/dev/null | grep -qx paper-bot; then
+# 다시 만들 봇 컨테이너. 모의 실행 봇은 .env의 COMPOSE_PROFILES=paper일 때만 있다
+bots=(bot)
+paper=false
+if "${DOCKER[@]}" compose config --services 2>/dev/null | grep -qx paper-bot; then
+    paper=true
+    bots+=(paper-bot)
+fi
+if [ "${#migrations[@]}" -gt 0 ] && [ "$paper" = true ]; then
     echo "== 모의 DB 마이그레이션"
     timeout "$UP_TIMEOUT" "${DOCKER[@]}" compose stop paper-bot || true
     for migration in "${migrations[@]}"; do
@@ -147,7 +154,7 @@ if [ "${#migrations[@]}" -gt 0 ] && "${DOCKER[@]}" compose config --services 2>/
             sh -c 'psql -q -v ON_ERROR_STOP=1 --single-transaction -U "$POSTGRES_USER" -d "${POSTGRES_DB}_paper"' <"$migration"; then
             echo "경고: 모의 DB 마이그레이션($migration)에 실패해 모의 봇은 시작하지 않습니다. 실거래 봇은 계속 업데이트합니다.
   모의 DB가 없으면: ./scripts/init_paper_db.sh / 원인을 고친 뒤 다시 적용하고 시작: ${DOCKER[*]} compose up -d paper-bot" >&2
-            up_services=(db bot)
+            bots=(bot)
             break
         fi
     done
@@ -155,13 +162,16 @@ fi
 
 echo "== 재시작"
 restarted_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-rollback="git reset --keep $(git rev-parse --short "$before") && ${DOCKER[*]} compose up -d --build"
+rollback="git reset --keep $(git rev-parse --short "$before") && ${DOCKER[*]} compose up -d --build --force-recreate ${bots[*]}"
 if [ "${#migrations[@]}" -gt 0 ]; then
     # 코드는 되돌려도 적용한 마이그레이션은 DB에 남는다
     rollback="$rollback
   (적용한 마이그레이션은 DB에 남습니다. 이전 코드가 바뀐 스키마로 동작하는지 먼저 확인하세요)"
 fi
-timeout "$UP_TIMEOUT" "${DOCKER[@]}" compose up -d "${up_services[@]}" ||
+# 봇은 설정 파일(config/*.json)을 시작할 때만 읽는다. 설정만 바뀐 배포는 이미지가 같아 compose가 다시 만들지 않으므로
+# 봇 컨테이너는 항상 다시 만든다. DB는 필요할 때만(꺼져 있거나 설정이 바뀌었을 때) 다시 만든다
+{ timeout "$UP_TIMEOUT" "${DOCKER[@]}" compose up -d db &&
+    timeout "$UP_TIMEOUT" "${DOCKER[@]}" compose up -d --force-recreate --no-deps "${bots[@]}"; } ||
     fail "재시작(docker compose up)에 실패했습니다. 상태를 확인해 주세요.
   이전 버전으로 되돌리기: $rollback"
 
