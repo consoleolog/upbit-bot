@@ -118,6 +118,16 @@ def server(tmp_path: Path) -> Server:
     return Server(tmp_path)
 
 
+UP_DB = "compose up -d db"
+# 봇 컨테이너는 배포마다 다시 만든다 (설정 파일만 바뀌어도 반영되게)
+RECREATE_BOT = "compose up -d --force-recreate --no-deps bot"
+RECREATE_BOTH = "compose up -d --force-recreate --no-deps bot paper-bot"
+
+
+def _restarted(server: "Server") -> bool:
+    return any(call.startswith("compose up") for call in server.docker_calls())
+
+
 def test_updates_builds_and_restarts(server: Server) -> None:
     server.push("src/app.py", "print(1)\n", "feat: 새 기능")
 
@@ -128,7 +138,7 @@ def test_updates_builds_and_restarts(server: Server) -> None:
     assert server.head() == "feat: 새 기능"
     calls = server.docker_calls()
     # 빌드를 먼저 하고 재시작한다
-    assert calls.index("compose build bot") < calls.index("compose up -d")
+    assert calls.index("compose build bot") < calls.index(UP_DB) < calls.index(RECREATE_BOT)
     assert "완료" in result.stdout
 
 
@@ -160,7 +170,7 @@ def test_schema_applied_option_continues(server: Server) -> None:
 
     assert result.returncode == 0, result.stderr
     assert server.head() == "feat: 테이블 추가"
-    assert "compose up -d" in server.docker_calls()
+    assert RECREATE_BOT in server.docker_calls()
 
 
 def test_uncommitted_changes_stop(server: Server) -> None:
@@ -184,7 +194,7 @@ def test_build_failure_keeps_running_bot_and_reverts_code(server: Server) -> Non
     assert result.returncode == 1
     assert "이미지 빌드에 실패" in result.stderr
     assert server.head() == "script"
-    assert "compose up -d" not in server.docker_calls()
+    assert not _restarted(server)
 
 
 def test_start_timeout_reports_logs_and_rollback(server: Server) -> None:
@@ -251,7 +261,7 @@ def test_prod_branch_updates_from_origin_prod(server: Server) -> None:
 
     assert result.returncode == 0, result.stderr
     assert server.head() == "chore: 실거래 켜기"
-    assert "compose up -d" in server.docker_calls()
+    assert RECREATE_BOT in server.docker_calls()
 
 
 def test_missing_env_file_stops(server: Server) -> None:
@@ -292,7 +302,7 @@ def test_new_migrations_are_applied_in_order_before_restart(server: Server) -> N
         calls.index("compose build bot")
         < calls.index("compose stop bot")
         < calls.index(MIGRATE_CALL)
-        < calls.index("compose up -d")
+        < calls.index(RECREATE_BOT)
     )
 
 
@@ -319,7 +329,7 @@ def test_first_migration_failure_restarts_previous_bot(server: Server) -> None:
     assert server.head() == "script"
     calls = server.docker_calls()
     assert calls.index("compose stop bot") < calls.index("compose start bot")
-    assert "compose up -d" not in calls
+    assert not _restarted(server)
 
 
 @pytest.mark.parametrize(
@@ -338,7 +348,7 @@ def test_uncertain_migration_failure_leaves_bot_stopped(server: Server, fail_at:
     assert server.head() == "script"
     calls = server.docker_calls()
     assert "compose start bot" not in calls
-    assert "compose up -d" not in calls
+    assert not _restarted(server)
 
 
 def test_stop_failure_does_not_migrate(server: Server) -> None:
@@ -437,7 +447,7 @@ def test_paper_db_gets_same_migrations_before_restart(server: Server) -> None:
         calls.index(MIGRATE_CALL)
         < calls.index("compose stop paper-bot")
         < calls.index(PAPER_MIGRATE_CALL)
-        < calls.index("compose up -d")
+        < calls.index(RECREATE_BOTH)
     )
 
 
@@ -450,7 +460,7 @@ def test_paper_migration_failure_does_not_block_live_update(server: Server) -> N
     assert result.returncode == 0, result.stderr
     assert "모의 DB 마이그레이션" in result.stderr and "init_paper_db.sh" in result.stderr
     assert server.head() == "feat: a2"
-    assert "compose up -d db bot" in server.docker_calls()
+    assert RECREATE_BOT in server.docker_calls() and RECREATE_BOTH not in server.docker_calls()
 
 
 def test_paper_not_used_skips_paper_migration(server: Server) -> None:
@@ -469,4 +479,24 @@ def test_update_without_migration_does_not_touch_paper_db(server: Server) -> Non
     calls = server.docker_calls()
     assert PAPER_MIGRATE_CALL not in calls
     # 모의 봇도 함께 새 이미지로 다시 시작한다
-    assert "compose up -d" in calls
+    assert RECREATE_BOTH in calls
+
+
+def test_config_only_change_recreates_bot(server: Server) -> None:
+    # 설정 파일만 바뀌어 이미지가 같아도 봇을 다시 만들어 새 설정을 읽게 한다
+    server.push("config/trading.json", '{"timeframe": "15m"}\n', "chore: 설정 변경")
+
+    result = server.run()
+
+    assert result.returncode == 0, result.stderr
+    calls = server.docker_calls()
+    assert calls.index(UP_DB) < calls.index(RECREATE_BOT)
+    # DB는 다시 만들지 않는다
+    assert [call for call in calls if "--force-recreate" in call] == [RECREATE_BOT]
+
+
+def test_paper_bot_is_recreated_with_bot(server: Server) -> None:
+    server.push("config/trading.paper.json", '{"timeframe": "15m"}\n', "chore: 모의 설정 변경")
+
+    assert server.run(**PAPER).returncode == 0
+    assert RECREATE_BOTH in server.docker_calls()
