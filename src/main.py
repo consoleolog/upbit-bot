@@ -105,7 +105,9 @@ async def run(
             )
             app.add_service(f"scheduler:{config.timeframe}", scheduler.run)
             # 캔들 마감 사이에는 현재가로 보유 중인 포지션의 손절·익절만 판단한다 (매매 로직 5.1)
-            realtime_exit = RealtimeExit(database=database, market_ids=market_ids, submit=app.submit, live=live)
+            realtime_exit = RealtimeExit(
+                database=database, market_ids=market_ids, submit=app.submit, live=live, order_settings=config.order
+            )
             feed = TickerFeed(markets=config.markets, on_ticker=realtime_exit.on_ticker)
             app.add_service("ticker", feed.run)
             if isinstance(notifier, DiscordNotifier):

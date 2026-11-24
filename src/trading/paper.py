@@ -7,7 +7,7 @@ from decimal import Decimal
 
 import asyncpg
 
-from src.app.config import ExitSettings, OrderSettings
+from src.app.config import ExitSettings, OrderSettings, StopLossBy
 from src.exchange.candle import Candle
 from src.exchange.ticker import Ticker
 from src.repositories.indicator_info import IndicatorInfoRepository
@@ -55,7 +55,10 @@ async def apply_paper_decision(
         exit_settings=exit_settings if current is None else _held_exit_settings(current),
         stochastic_entry_max=stochastic_entry_max,
         sell_fee_rate=PAPER_FEE_RATE,
-        can_add=current is not None and current.buy_count - 1 < order_settings.max_add_buys,
+        can_add=current is not None and order_settings.adds_left(current.buy_count),
+        add_buy_trigger=order_settings.add_buy_trigger,
+        stop_loss_deferred=current is not None and order_settings.stop_loss_deferred(current.buy_count),
+        stop_loss_by=order_settings.stop_loss_by,
     )
     if decision is None:
         return None
@@ -95,10 +98,14 @@ async def apply_paper_decision(
     return await _sell(conn, current, decision, time=candle.start, price=candle.close)
 
 
-async def apply_realtime_exit(conn: asyncpg.Connection, *, market_id: int, ticker: Ticker) -> PaperTrade | None:
+async def apply_realtime_exit(
+    conn: asyncpg.Connection, *, market_id: int, ticker: Ticker, order_settings: OrderSettings | None = None
+) -> PaperTrade | None:
     """캔들 마감 사이에 현재가로 보유 중인 모의 포지션의 손절·익절만 판단한다 (매매 로직 5.1). 팔지 않으면 None.
 
     신호 상태 없이 판단하므로 decide는 손절 → 익절만 본다. 기준은 매수할 때 저장한 값이다 (매매 로직 2.3).
+    order_settings의 stop_loss_after_adds이고 추가 매수가 남아 있으면 손절하지 않는다.
+    order_settings의 stop_loss_by가 MACD_DEAD_CROSS면 신호 상태가 필요하므로 여기서는 손절하지 않는다 (익절만).
     매도를 기록하면 이 마켓의 신호 상태를 모두 비운다 (매매 로직 7). 호출하는 쪽의 트랜잭션 안에서 실행한다.
     """
     current = await PaperPositionRepository().get_open(conn, market_id)
@@ -114,6 +121,8 @@ async def apply_realtime_exit(conn: asyncpg.Connection, *, market_id: int, ticke
         # 보유 중이라 매수 판단은 하지 않으므로 쓰이지 않는다
         stochastic_entry_max=0.0,
         sell_fee_rate=PAPER_FEE_RATE,
+        stop_loss_deferred=order_settings is not None and order_settings.stop_loss_deferred(current.buy_count),
+        stop_loss_by=StopLossBy.RATE if order_settings is None else order_settings.stop_loss_by,
     )
     if decision is None:
         return None

@@ -76,6 +76,10 @@ class LiveTrader:
         if await self._blocked(market, market_id):
             return
         position = await self._open_position(market_id)
+        deferred = position is not None and self._order.stop_loss_deferred(position.buy_count)
+        # 추가 매수가 남아 있어도 실제로 살 수 없으면(잔고 부족, 주문 금액 범위 밖) 복구를 기다릴 수 없으므로 미루지 않는다
+        if deferred and position is not None and not await self._next_add_possible(market, position):
+            deferred = False
         decision = decide(
             states=states,
             holding=None if position is None else Holding(average_price=position.average_price),
@@ -84,7 +88,10 @@ class LiveTrader:
             exit_settings=self._exit_settings if position is None else _held_exit_settings(position),
             stochastic_entry_max=self._stochastic_entry_max,
             sell_fee_rate=self._chances[market].ask_fee,
-            can_add=position is not None and position.buy_count - 1 < self._order.max_add_buys,
+            can_add=position is not None and self._order.adds_left(position.buy_count),
+            add_buy_trigger=self._order.add_buy_trigger,
+            stop_loss_deferred=deferred,
+            stop_loss_by=self._order.stop_loss_by,
         )
         if decision is None:
             return
@@ -102,7 +109,10 @@ class LiveTrader:
         await self._sell(market, market_id, position, decision)
 
     async def on_ticker(self, market: str, market_id: int, ticker: Ticker) -> None:
-        """캔들 마감 사이에 현재가로 손절·익절만 판단한다 (매매 로직 5.1)."""
+        """캔들 마감 사이에 현재가로 손절·익절만 판단한다 (매매 로직 5.1).
+
+        손절 방식이 MACD 데드크로스면 신호 상태가 필요하므로 여기서는 손절하지 않는다 (익절만).
+        """
         if await self._blocked(market, market_id):
             return
         position = await self._open_position(market_id)
@@ -118,6 +128,8 @@ class LiveTrader:
             # 보유 중이라 매수 판단은 하지 않으므로 쓰이지 않는다
             stochastic_entry_max=0.0,
             sell_fee_rate=self._chances[market].ask_fee,
+            stop_loss_deferred=self._order.stop_loss_deferred(position.buy_count),
+            stop_loss_by=self._order.stop_loss_by,
         )
         if decision is not None:
             await self._sell(market, market_id, position, decision)
@@ -161,9 +173,7 @@ class LiveTrader:
         """
         async with self._buy_lock:
             chance = self._chances[market]
-            # 첫 매수 금액의 몇 배인지로 계산해, 직전 매수 기준이어도 원 단위 내림이 쌓이지 않게 한다
-            units = self._order.add_buy_units(position.buy_count)
-            amount = (position.first_buy_amount * units).to_integral_value(rounding=ROUND_DOWN)
+            amount = self._next_add_amount(position)
             minimum = min_buy_amount(chance)
             if not minimum <= amount <= chance.max_total:
                 logger.info(
@@ -186,6 +196,39 @@ class LiveTrader:
                 )
                 return
             await self._executor.buy(market, market_id, amount, reason=Reason.ADD)
+
+    def _next_add_amount(self, position: LivePosition) -> Decimal:
+        """다음 추가 매수 주문 금액 (원 단위 내림)."""
+        # 첫 매수 금액의 몇 배인지로 계산해, 직전 매수 기준이어도 원 단위 내림이 쌓이지 않게 한다
+        units = self._order.add_buy_units(position.buy_count)
+        return (position.first_buy_amount * units).to_integral_value(rounding=ROUND_DOWN)
+
+    async def _next_add_possible(self, market: str, position: LivePosition) -> bool:
+        """다음 추가 매수를 지금 실제로 할 수 있는지. 손절을 미룰지 정하는 데 쓴다.
+
+        주문 금액이 최소·최대 범위 밖이거나 잔고(수수료 포함)가 모자라면 False.
+        잔고를 조회하지 못하면 판단할 수 없으므로 True (손절을 미뤄 새 주문을 내지 않는다).
+        """
+        chance = self._chances[market]
+        amount = self._next_add_amount(position)
+        if not min_buy_amount(chance) <= amount <= chance.max_total:
+            logger.info("stop loss not deferred: next add buy out of range (market=%s, amount=%s)", market, amount)
+            return False
+        try:
+            accounts = await self._upbit.get_accounts()
+        except UpbitError as error:
+            logger.warning("stop loss deferred: balance unavailable (market=%s): %s", market, error)
+            return True
+        balance = next((account.balance for account in accounts if account.currency == KRW), Decimal(0))
+        if balance < amount * (1 + chance.bid_fee):
+            logger.info(
+                "stop loss not deferred: balance too low for next add buy (market=%s, amount=%s, balance=%s)",
+                market,
+                amount,
+                balance,
+            )
+            return False
+        return True
 
     async def _sell(self, market: str, market_id: int, position: LivePosition | None, decision: Decision) -> None:
         if position is None:

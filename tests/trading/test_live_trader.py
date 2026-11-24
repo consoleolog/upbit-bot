@@ -10,12 +10,12 @@ from decimal import Decimal
 import pytest
 import pytest_asyncio
 
-from src.app.config import AddBuyBase, ExitSettings, OrderSettings
+from src.app.config import AddBuyBase, ExitSettings, OrderSettings, StopLossBy
 from src.connections.database import Database
 from src.exchange.account import Account, OrderChance
 from src.exchange.candle import Candle
 from src.exchange.ticker import Ticker
-from src.exchange.upbit_client import UpbitServerError
+from src.exchange.upbit_client import UpbitConnectionError, UpbitServerError
 from src.repositories.market import MarketRepository
 from src.repositories.models import IndicatorInfo, IndicatorType
 from src.repositories.position import PositionRepository
@@ -464,3 +464,125 @@ async def test_stop_loss_comes_before_add_buy(env: Env) -> None:
 
     assert env.executor.buys == []
     assert env.executor.sells == [(env.market, Decimal("0.001"), Reason.STOP_LOSS)]
+
+
+@pytest.mark.parametrize(("buys", "sold"), [(1, False), (2, False), (3, True)])
+async def test_realtime_stop_loss_waits_until_adds_used_up(env: Env, buys: int, sold: bool) -> None:
+    env.order = replace(env.order, stop_loss_after_adds=True)
+    env.trader = env.make_trader()
+    await env.hold(buys=buys)
+
+    # 순수익률 약 -5%. 추가 매수가 남아 있으면 손절하지 않는다 (한도 2번)
+    await env.tick("95000000")
+
+    assert env.executor.sells == ([(env.market, Decimal("0.001"), Reason.STOP_LOSS)] if sold else [])
+
+
+async def test_realtime_has_no_fixed_stop_with_macd_stop(env: Env) -> None:
+    env.order = replace(env.order, stop_loss_after_adds=True, stop_loss_by=StopLossBy.MACD_DEAD_CROSS)
+    env.trader = env.make_trader()
+    await env.hold(buys=3)
+
+    # 순수익률 약 -20%여도 실시간으로는 팔지 않는다 (MACD 손절은 캔들 마감 때 판단)
+    await env.tick("80000000")
+
+    assert env.executor.sells == []
+
+
+@pytest.mark.parametrize(("buys", "sold"), [(1, False), (3, True)])
+async def test_macd_stop_on_candle_after_adds_used_up(env: Env, buys: int, sold: bool) -> None:
+    env.order = replace(env.order, stop_loss_after_adds=True, stop_loss_by=StopLossBy.MACD_DEAD_CROSS)
+    env.trader = env.make_trader()
+    await env.hold(buys=buys)
+    states = {
+        t: replace(info, cross_state=CrossState.DEAD_CROSS, over_state=None, over_time=None)
+        if t in (IndicatorType.MACD_SHORT, IndicatorType.MACD_MID, IndicatorType.MACD_LONG)
+        else replace(info, cross_state=None, over_state=None, over_time=None)
+        for t, info in _entry_states(env.market_id, T0).items()
+    }
+
+    # 추가 매수를 다 썼고 MACD 3종이 모두 데드크로스면 판다 (고정 % 기준과 무관하게 -1%에서도)
+    await env.trader.on_candle(
+        env.market, env.market_id, candle=_candle(env.market, "99000000", T0), states=states, allow_buy=True
+    )
+
+    assert env.executor.sells == ([(env.market, Decimal("0.001"), Reason.STOP_LOSS)] if sold else [])
+
+
+def _macd_dead_states(market_id: int) -> dict[IndicatorType, IndicatorInfo]:
+    macd = (IndicatorType.MACD_SHORT, IndicatorType.MACD_MID, IndicatorType.MACD_LONG)
+    return {
+        t: replace(info, cross_state=CrossState.DEAD_CROSS if t in macd else None, over_state=None, over_time=None)
+        for t, info in _entry_states(market_id, T0).items()
+    }
+
+
+async def _macd_candle(env: Env, close: str = "99000000") -> None:
+    await env.trader.on_candle(
+        env.market,
+        env.market_id,
+        candle=_candle(env.market, close, T0),
+        states=_macd_dead_states(env.market_id),
+        allow_buy=True,
+    )
+
+
+def _use_macd_stop(env: Env) -> None:
+    env.order = replace(env.order, stop_loss_after_adds=True, stop_loss_by=StopLossBy.MACD_DEAD_CROSS)
+    env.trader = env.make_trader()
+
+
+async def test_stop_not_deferred_when_next_add_unaffordable(env: Env) -> None:
+    # 추가 매수가 남아 있어도 다음 추가 매수(15,000원 + 수수료)를 살 잔고가 없으면 복구를 기다리지 않고 손절한다
+    _use_macd_stop(env)
+    await env.hold(buys=1)
+    env.accounts.balance = "15000"
+
+    await _macd_candle(env)
+
+    assert env.executor.sells == [(env.market, Decimal("0.001"), Reason.STOP_LOSS)]
+
+
+async def test_stop_deferred_when_next_add_affordable(env: Env) -> None:
+    _use_macd_stop(env)
+    await env.hold(buys=1)
+    env.accounts.balance = "15007.5"
+
+    await _macd_candle(env)
+
+    assert env.executor.sells == []
+
+
+async def test_stop_deferred_when_balance_unavailable(env: Env) -> None:
+    # 잔고를 알 수 없으면 판단할 수 없으므로 새 주문(손절)을 내지 않는다
+    _use_macd_stop(env)
+    await env.hold(buys=1)
+    env.accounts.error = UpbitConnectionError("dns")
+
+    await _macd_candle(env)
+
+    assert env.executor.sells == []
+
+
+async def test_stop_not_deferred_when_next_add_out_of_range(env: Env) -> None:
+    # 다음 추가 매수 금액(15,000원)이 최대 주문 금액을 넘으면 살 수 없으므로 손절한다
+    env.chances[env.market] = _chance(env.market, max_total="14999")
+    _use_macd_stop(env)
+    await env.hold(buys=1)
+
+    await _macd_candle(env)
+
+    assert env.executor.sells == [(env.market, Decimal("0.001"), Reason.STOP_LOSS)]
+    # 범위 밖이면 잔고를 볼 필요가 없다
+    assert env.accounts.calls == 0
+
+
+async def test_balance_not_checked_when_not_deferring(env: Env) -> None:
+    # 추가 매수를 다 썼으면(미루지 않으면) 잔고를 조회하지 않는다
+    _use_macd_stop(env)
+    await env.hold(buys=3)
+
+    await _macd_candle(env)
+
+    assert env.executor.sells == [(env.market, Decimal("0.001"), Reason.STOP_LOSS)]
+    assert env.accounts.calls == 0

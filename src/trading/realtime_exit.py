@@ -4,6 +4,7 @@ import logging
 from collections.abc import Callable, Mapping
 
 from src.app.application import Job
+from src.app.config import OrderSettings
 from src.connections.database import Database
 from src.exchange.ticker import Ticker
 from src.trading.live_trader import LiveTrader
@@ -26,8 +27,11 @@ class RealtimeExit:
         market_ids: Mapping[str, int],
         submit: Callable[[str, Job], bool],
         live: LiveTrader | None = None,
+        order_settings: OrderSettings | None = None,
     ) -> None:
         self._database = database
+        # 모의 포지션의 비상 손절을 추가 매수 뒤로 미룰지 정한다 (실거래는 LiveTrader가 자기 설정으로 판단한다)
+        self._order_settings = order_settings
         # 있으면 실거래 포지션을, 없으면 모의 포지션을 판단한다
         self._live = live
         self._market_ids = market_ids
@@ -63,7 +67,9 @@ class RealtimeExit:
             await self._live.on_ticker(market, self._market_ids[market], ticker)
             return
         async with self._database.transaction() as conn:
-            trade = await apply_realtime_exit(conn, market_id=self._market_ids[market], ticker=ticker)
+            trade = await apply_realtime_exit(
+                conn, market_id=self._market_ids[market], ticker=ticker, order_settings=self._order_settings
+            )
         # 커밋된 뒤에 기록한다
         if trade is not None:
             logger.info(
