@@ -6,7 +6,17 @@ from pathlib import Path
 
 import pytest
 
-from src.app.config import AddBuyBase, ConfigError, ExitSettings, OrderSettings, Timeframe, TradingConfig, load_config
+from src.app.config import (
+    AddBuyBase,
+    AddBuyTrigger,
+    ConfigError,
+    ExitSettings,
+    OrderSettings,
+    StopLossBy,
+    Timeframe,
+    TradingConfig,
+    load_config,
+)
 from src.trading.indicators import IndicatorSettings
 from src.trading.signals import SignalSettings, Threshold
 
@@ -282,6 +292,8 @@ def test_paper_config_is_paper_with_more_markets_previous_add_buy_and_15m() -> N
     assert paper.markets == ("KRW-BTC", "KRW-ETH", "KRW-BCH", "KRW-SOL", "KRW-AAVE", "KRW-BSV", "KRW-ENS")
     assert paper.order.add_buy_base is AddBuyBase.PREVIOUS
     assert paper.timeframe is Timeframe.MINUTE_15
+    assert paper.order.add_buy_trigger is AddBuyTrigger.LOSS_RELAXED
+    assert paper.order.stop_loss_after_adds is True
 
 
 def test_paper_config_differs_from_live_only_in_markets_add_buy_and_timeframe() -> None:
@@ -294,7 +306,86 @@ def test_paper_config_differs_from_live_only_in_markets_add_buy_and_timeframe() 
             markets=live.markets,
             live=live.live,
             timeframe=live.timeframe,
-            order=replace(paper.order, add_buy_base=live.order.add_buy_base),
+            order=replace(
+                paper.order,
+                add_buy_base=live.order.add_buy_base,
+                add_buy_trigger=live.order.add_buy_trigger,
+                stop_loss_after_adds=live.order.stop_loss_after_adds,
+                stop_loss_by=live.order.stop_loss_by,
+            ),
         )
         == live
     )
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"), [("entry", AddBuyTrigger.ENTRY), ("loss_relaxed", AddBuyTrigger.LOSS_RELAXED)]
+)
+def test_add_buy_trigger_is_read(tmp_path: Path, value: str, expected: AddBuyTrigger) -> None:
+    config = load_config(_write(tmp_path, _with(("order", "add_buy_trigger"), value)))
+
+    assert config.order.add_buy_trigger is expected
+
+
+@pytest.mark.parametrize("value", ["loss", "", 1, None])
+def test_invalid_add_buy_trigger_rejected(tmp_path: Path, value: object) -> None:
+    with pytest.raises(ConfigError, match=r"order\.add_buy_trigger"):
+        load_config(_write(tmp_path, _with(("order", "add_buy_trigger"), value)))
+
+
+@pytest.mark.parametrize("value", [True, False])
+def test_stop_loss_after_adds_is_read(tmp_path: Path, value: bool) -> None:
+    config = load_config(_write(tmp_path, _with(("order", "stop_loss_after_adds"), value)))
+
+    assert config.order.stop_loss_after_adds is value
+
+
+@pytest.mark.parametrize("value", ["true", 1, None])
+def test_invalid_stop_loss_after_adds_rejected(tmp_path: Path, value: object) -> None:
+    with pytest.raises(ConfigError, match=r"order\.stop_loss_after_adds"):
+        load_config(_write(tmp_path, _with(("order", "stop_loss_after_adds"), value)))
+
+
+def test_loss_recovery_off_by_default() -> None:
+    order = OrderSettings()
+    assert (order.add_buy_trigger, order.stop_loss_after_adds, order.stop_loss_by) == (
+        AddBuyTrigger.ENTRY,
+        False,
+        StopLossBy.RATE,
+    )
+
+
+@pytest.mark.parametrize("path", [REPO_CONFIG.with_name("trading.paper.json")], ids=["paper"])
+def test_repository_configs_use_loss_recovery_and_macd_stop(path: Path) -> None:
+    # 손실 중 완화된 조건으로 추가 매수하고, 추가 매수를 다 쓴 뒤 MACD 3종 데드크로스로 손절한다 (고정 % 손절 없음)
+    order = load_config(path).order
+    assert (order.add_buy_trigger, order.stop_loss_after_adds, order.stop_loss_by) == (
+        AddBuyTrigger.LOSS_RELAXED,
+        True,
+        StopLossBy.MACD_DEAD_CROSS,
+    )
+
+
+@pytest.mark.parametrize(("buy_count", "adds_left", "deferred"), [(1, True, True), (2, True, True), (3, False, False)])
+def test_stop_loss_deferred_only_while_adds_left(buy_count: int, adds_left: bool, deferred: bool) -> None:
+    order = OrderSettings(max_add_buys=2, stop_loss_after_adds=True)
+
+    assert order.adds_left(buy_count) is adds_left
+    assert order.stop_loss_deferred(buy_count) is deferred
+    # 설정을 끄면 미루지 않는다
+    assert replace(order, stop_loss_after_adds=False).stop_loss_deferred(buy_count) is False
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"), [("rate", StopLossBy.RATE), ("macd_dead_cross", StopLossBy.MACD_DEAD_CROSS)]
+)
+def test_stop_loss_by_is_read(tmp_path: Path, value: str, expected: StopLossBy) -> None:
+    config = load_config(_write(tmp_path, _with(("order", "stop_loss_by"), value)))
+
+    assert config.order.stop_loss_by is expected
+
+
+@pytest.mark.parametrize("value", ["macd", "", 1, None])
+def test_invalid_stop_loss_by_rejected(tmp_path: Path, value: object) -> None:
+    with pytest.raises(ConfigError, match=r"order\.stop_loss_by"):
+        load_config(_write(tmp_path, _with(("order", "stop_loss_by"), value)))
