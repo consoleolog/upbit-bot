@@ -41,6 +41,22 @@ class AddBuyBase(StrEnum):
     PREVIOUS = "previous"  # 직전 매수 금액 * add_buy_multiple (첫 매수의 1.5배, 2.25배, ...)
 
 
+class AddBuyTrigger(StrEnum):
+    """추가 매수 조건."""
+
+    ENTRY = "entry"  # 신규 매수와 같은 9개 조건 (수익과 무관)
+    # 손실 중(순수익률 < 0)이고 완화된 6개 조건: RSI 골든, 스토캐스틱 과매도·골든, MACD 3종 골든 (숫자 저장소)
+    LOSS_RELAXED = "loss_relaxed"
+
+
+class StopLossBy(StrEnum):
+    """손절 방식."""
+
+    RATE = "rate"  # 순수익률이 exit.stop_loss_rate 이하면 판다 (캔들 마감과 실시간 모두)
+    # MACD 단기·중기·장기가 모두 데드크로스면 판다 (수익과 무관, 캔들 마감 때만). 고정 % 손절은 하지 않는다
+    MACD_DEAD_CROSS = "macd_dead_cross"
+
+
 @dataclass(frozen=True, kw_only=True)
 class OrderSettings:
     """주문 금액 (매매 로직 6.1). 매수 금액 = 원화 주문 가능 잔고 * buy_ratio / 100.
@@ -53,6 +69,18 @@ class OrderSettings:
     add_buy_multiple: Decimal = Decimal("1.5")
     max_add_buys: int = 0
     add_buy_base: AddBuyBase = AddBuyBase.FIRST
+    add_buy_trigger: AddBuyTrigger = AddBuyTrigger.ENTRY
+    # 참이면 추가 매수가 남아 있는 동안 손절하지 않는다 (추가 매수로 복구할 기회를 준다)
+    stop_loss_after_adds: bool = False
+    stop_loss_by: StopLossBy = StopLossBy.RATE
+
+    def adds_left(self, buy_count: int) -> bool:
+        """지금까지 buy_count번 샀을 때 추가 매수를 더 할 수 있는지."""
+        return buy_count - 1 < self.max_add_buys
+
+    def stop_loss_deferred(self, buy_count: int) -> bool:
+        """비상 손절을 미루는지 (stop_loss_after_adds이고 추가 매수가 남아 있을 때)."""
+        return self.stop_loss_after_adds and self.adds_left(buy_count)
 
     def add_buy_units(self, buy_count: int) -> Decimal:
         """지금까지 buy_count번 샀을 때 다음 추가 매수 금액이 첫 매수 금액의 몇 배인지.
@@ -103,7 +131,19 @@ def load_config(path: Path) -> TradingConfig:
     root = _object(raw, "config", {"timeframe", "markets", "indicator", "threshold", "order", "exit", "live"})
     indicator = _object(root.get("indicator", {}), "indicator", {"ema", "macd_signal", "rsi", "stochastic"})
     threshold = _object(root.get("threshold", {}), "threshold", {"rsi", "stochastic", "stochastic_entry_max"})
-    order = _object(root.get("order", {}), "order", {"buy_ratio", "add_buy_multiple", "max_add_buys", "add_buy_base"})
+    order = _object(
+        root.get("order", {}),
+        "order",
+        {
+            "buy_ratio",
+            "add_buy_multiple",
+            "max_add_buys",
+            "add_buy_base",
+            "add_buy_trigger",
+            "stop_loss_after_adds",
+            "stop_loss_by",
+        },
+    )
     exit_ = _object(root.get("exit", {}), "exit", {"take_profit_rate", "stop_loss_rate", "min_profit_rate"})
     # 기간·기준의 범위와 순서는 각 설정 클래스가 만들 때 검증한다
     try:
@@ -232,8 +272,23 @@ def _parse_order(section: Mapping[str, object]) -> OrderSettings:
     base = section.get("add_buy_base", OrderSettings.add_buy_base.value)
     if base not in {b.value for b in AddBuyBase}:
         raise ConfigError(f"order.add_buy_base must be one of {[b.value for b in AddBuyBase]}: {base!r}")
+    trigger = section.get("add_buy_trigger", OrderSettings.add_buy_trigger.value)
+    if trigger not in {t.value for t in AddBuyTrigger}:
+        raise ConfigError(f"order.add_buy_trigger must be one of {[t.value for t in AddBuyTrigger]}: {trigger!r}")
+    stop_after_adds = section.get("stop_loss_after_adds", OrderSettings.stop_loss_after_adds)
+    if not isinstance(stop_after_adds, bool):
+        raise ConfigError(f"order.stop_loss_after_adds must be true or false: {stop_after_adds!r}")
+    stop_by = section.get("stop_loss_by", OrderSettings.stop_loss_by.value)
+    if stop_by not in {b.value for b in StopLossBy}:
+        raise ConfigError(f"order.stop_loss_by must be one of {[b.value for b in StopLossBy]}: {stop_by!r}")
     return OrderSettings(
-        buy_ratio=buy_ratio, add_buy_multiple=add_buy_multiple, max_add_buys=max_add_buys, add_buy_base=AddBuyBase(base)
+        buy_ratio=buy_ratio,
+        add_buy_multiple=add_buy_multiple,
+        max_add_buys=max_add_buys,
+        add_buy_base=AddBuyBase(base),
+        add_buy_trigger=AddBuyTrigger(trigger),
+        stop_loss_after_adds=stop_after_adds,
+        stop_loss_by=StopLossBy(stop_by),
     )
 
 

@@ -6,7 +6,7 @@ from decimal import Decimal
 import asyncpg
 import pytest
 
-from src.app.config import AddBuyBase, ExitSettings, OrderSettings
+from src.app.config import AddBuyBase, AddBuyTrigger, ExitSettings, OrderSettings, StopLossBy
 from src.exchange.candle import Candle
 from src.exchange.ticker import Ticker
 from src.repositories.indicator_info import IndicatorInfoRepository
@@ -443,3 +443,126 @@ async def test_sell_comes_before_add_buy(conn: asyncpg.Connection) -> None:
     )
 
     assert trade is not None and trade.decision.reason is Reason.STOP_LOSS
+
+
+RECOVER = OrderSettings(max_add_buys=2, stop_loss_after_adds=True, add_buy_trigger=AddBuyTrigger.LOSS_RELAXED)
+
+
+@pytest.mark.parametrize(("buys", "closed"), [(1, False), (2, False), (3, True)])
+async def test_realtime_stop_loss_waits_until_adds_used_up(conn: asyncpg.Connection, buys: int, closed: bool) -> None:
+    # 추가 매수가 남아 있으면 손절 기준(-3%) 아래여도 팔지 않고 복구를 기다린다
+    market_id = await _market_id(conn)
+    await _hold(conn, market_id)
+    await conn.execute("UPDATE paper_position SET buy_count = $2 WHERE market_id = $1", market_id, buys)
+
+    trade = await apply_realtime_exit(conn, market_id=market_id, ticker=_tick("95"), order_settings=RECOVER)
+
+    if closed:
+        assert trade is not None and trade.decision.reason is Reason.STOP_LOSS
+    else:
+        assert trade is None
+        assert await positions.get_open(conn, market_id) is not None
+
+
+async def test_realtime_stop_loss_without_recover_setting(conn: asyncpg.Connection) -> None:
+    market_id = await _market_id(conn)
+    await _hold(conn, market_id)
+
+    trade = await apply_realtime_exit(conn, market_id=market_id, ticker=_tick("95"), order_settings=ADD_TWO)
+
+    assert trade is not None and trade.decision.reason is Reason.STOP_LOSS
+
+
+async def _save_relaxed(
+    conn: asyncpg.Connection, market_id: int, candle_time: datetime
+) -> dict[IndicatorType, IndicatorInfo]:
+    """완화된 6개 조건만 참인 상태 (RSI 과매도 없음, %K·%D 60)."""
+    states = {}
+    for indicator_type in IndicatorType:
+        info = IndicatorInfo(
+            market_id=market_id,
+            indicator_type=indicator_type,
+            value=60.0,
+            signal=55.0,
+            candle_time=candle_time,
+            cross_state=CrossState.GOLDEN_CROSS,
+            cross_time=candle_time,
+        )
+        if indicator_type is IndicatorType.STOCHASTIC:
+            info = replace(info, over_state=OverState.OVER_SOLD, over_time=candle_time)
+        assert await infos.save(conn, info) is not None
+        states[indicator_type] = info
+    return states
+
+
+@pytest.mark.parametrize(("close", "added"), [("95", True), ("101", False)])
+async def test_loss_relaxed_add_buy_on_candle(conn: asyncpg.Connection, close: str, added: bool) -> None:
+    # 손실 중(95)이면 손절 기준 아래여도 팔지 않고 완화된 조건으로 추가 매수한다. 수익 중(101)이면 사지 않는다
+    market_id = await _market_id(conn)
+    await _apply(conn, market_id, _candle(T0, "100"), await _save_states(conn, market_id, T0, entry=True))
+    t2 = T1 + timedelta(minutes=30)
+
+    trade = await _apply(
+        conn, market_id, _candle(t2, close), await _save_relaxed(conn, market_id, t2), order_settings=RECOVER
+    )
+
+    if added:
+        assert trade is not None and trade.decision == Decision(action=Action.BUY, reason=Reason.ADD)
+        assert trade.position.buy_count == 2
+    else:
+        assert trade is None
+
+
+MACD_STOP_SETTINGS = replace(RECOVER, stop_loss_by=StopLossBy.MACD_DEAD_CROSS)
+
+
+async def test_realtime_has_no_fixed_stop_with_macd_stop(conn: asyncpg.Connection) -> None:
+    # 추가 매수를 다 썼어도 실시간으로는 고정 % 손절을 하지 않는다 (MACD는 캔들 마감 때 판단)
+    market_id = await _market_id(conn)
+    await _hold(conn, market_id)
+    await conn.execute("UPDATE paper_position SET buy_count = 3 WHERE market_id = $1", market_id)
+
+    assert (
+        await apply_realtime_exit(conn, market_id=market_id, ticker=_tick("80"), order_settings=MACD_STOP_SETTINGS)
+        is None
+    )
+    assert await positions.get_open(conn, market_id) is not None
+
+
+async def _save_macd_dead(
+    conn: asyncpg.Connection, market_id: int, candle_time: datetime
+) -> dict[IndicatorType, IndicatorInfo]:
+    """MACD 3종이 모두 데드크로스인 상태 (RSI·스토캐스틱은 신호 없음)."""
+    states = {}
+    for indicator_type in IndicatorType:
+        info = IndicatorInfo(
+            market_id=market_id, indicator_type=indicator_type, value=40.0, signal=30.0, candle_time=candle_time
+        )
+        if indicator_type not in (IndicatorType.RSI, IndicatorType.STOCHASTIC):
+            info = replace(info, cross_state=CrossState.DEAD_CROSS, cross_time=candle_time)
+        assert await infos.save(conn, info) is not None
+        states[indicator_type] = info
+    return states
+
+
+@pytest.mark.parametrize(("buys", "sold"), [(1, False), (2, False), (3, True)])
+async def test_macd_stop_on_candle_after_adds_used_up(conn: asyncpg.Connection, buys: int, sold: bool) -> None:
+    # 고정 % 손절 기준(-3%)에 닿지 않는 -1%에서도, 추가 매수를 다 썼고 MACD 3종이 모두 데드크로스면 판다
+    market_id = await _market_id(conn)
+    await _apply(conn, market_id, _candle(T0, "100"), await _save_states(conn, market_id, T0, entry=True))
+    await conn.execute("UPDATE paper_position SET buy_count = $2 WHERE market_id = $1", market_id, buys)
+    t2 = T1 + timedelta(minutes=30)
+
+    trade = await _apply(
+        conn,
+        market_id,
+        _candle(t2, "99"),
+        await _save_macd_dead(conn, market_id, t2),
+        order_settings=MACD_STOP_SETTINGS,
+    )
+
+    if sold:
+        assert trade is not None and trade.decision == Decision(action=Action.SELL, reason=Reason.STOP_LOSS)
+        assert trade.position.status is PositionStatus.CLOSED
+    else:
+        assert trade is None

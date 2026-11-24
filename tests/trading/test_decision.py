@@ -4,9 +4,18 @@ from decimal import Decimal
 
 import pytest
 
-from src.app.config import ExitSettings
+from src.app.config import AddBuyTrigger, ExitSettings, StopLossBy
 from src.repositories.models import IndicatorInfo, IndicatorType
-from src.trading.decision import Action, Decision, Holding, Reason, decide, entry_conditions, net_profit_rate
+from src.trading.decision import (
+    Action,
+    Decision,
+    Holding,
+    Reason,
+    decide,
+    entry_conditions,
+    net_profit_rate,
+    relaxed_add_conditions,
+)
 from src.trading.signals import CrossState, OverState
 
 T0 = datetime(2026, 1, 1, tzinfo=UTC)
@@ -379,3 +388,171 @@ def test_each_entry_condition_is_counted_and_blocks_buy(change: object, index: i
     # 바꾼 조건 하나만 거짓이고, 그 하나 때문에 매수하지 않는다
     assert [i for i, ok in enumerate(conditions) if not ok] == [index]
     assert _decide(states) is None
+
+
+# ---------------------------------------------------------------------------
+# 손실 중 완화된 추가 매수, 추가 매수가 남아 있는 동안 손절 미루기
+# ---------------------------------------------------------------------------
+
+
+def _relaxed_states() -> dict[IndicatorType, IndicatorInfo]:
+    """완화된 6개 조건만 참인 상태: RSI 과매도 없음, %K·%D가 50 초과라 신규 매수 9개 조건은 거짓."""
+    golden, sold = CrossState.GOLDEN_CROSS, OverState.OVER_SOLD
+    states = {
+        IndicatorType.RSI: _with(_info(IndicatorType.RSI, value=45.0), cross=golden),
+        IndicatorType.STOCHASTIC: _with(
+            _info(IndicatorType.STOCHASTIC, value=60.0, signal=55.0), over=sold, cross=golden
+        ),
+    }
+    return states | {t: _with(_info(t), cross=golden) for t in MACD_TYPES}
+
+
+def _decide_add(
+    states: dict[IndicatorType, IndicatorInfo],
+    close: str,
+    *,
+    trigger: AddBuyTrigger = AddBuyTrigger.LOSS_RELAXED,
+    can_add: bool = True,
+    deferred: bool = False,
+) -> Decision | None:
+    return decide(
+        states=states,
+        holding=HOLDING,
+        candle_time=T0,
+        close=Decimal(close),
+        exit_settings=EXIT,
+        stochastic_entry_max=50.0,
+        sell_fee_rate=NO_FEE,
+        can_add=can_add,
+        add_buy_trigger=trigger,
+        stop_loss_deferred=deferred,
+    )
+
+
+ADD = Decision(action=Action.BUY, reason=Reason.ADD)
+
+
+@pytest.mark.parametrize("close", ["99.99", "98", "97.01"])
+def test_loss_relaxed_add_when_losing(close: str) -> None:
+    assert relaxed_add_conditions(_relaxed_states())
+    assert _decide_add(_relaxed_states(), close) == ADD
+
+
+@pytest.mark.parametrize("close", ["100", "101"])
+def test_no_loss_relaxed_add_without_loss(close: str) -> None:
+    # 손실 중일 때만 평단을 낮추려고 산다
+    assert _decide_add(_relaxed_states(), close) is None
+
+
+def test_entry_trigger_does_not_use_relaxed_conditions() -> None:
+    # 기본(ENTRY)은 9개 조건이라, RSI 과매도가 없고 %K·%D가 50을 넘으면 사지 않는다
+    assert _decide_add(_relaxed_states(), "98", trigger=AddBuyTrigger.ENTRY) is None
+    assert _decide_add(_entry_states(), "98", trigger=AddBuyTrigger.ENTRY) == ADD
+
+
+@pytest.mark.parametrize(
+    "drop",
+    [
+        lambda s: s | {IndicatorType.RSI: replace(s[IndicatorType.RSI], cross_state=None)},
+        lambda s: s | {IndicatorType.STOCHASTIC: replace(s[IndicatorType.STOCHASTIC], over_state=None)},
+        lambda s: s | {IndicatorType.STOCHASTIC: replace(s[IndicatorType.STOCHASTIC], cross_state=None)},
+        lambda s: s | {IndicatorType.MACD_SHORT: replace(s[IndicatorType.MACD_SHORT], cross_state=None)},
+        lambda s: s | {IndicatorType.MACD_MID: replace(s[IndicatorType.MACD_MID], cross_state=None)},
+        lambda s: s | {IndicatorType.MACD_LONG: replace(s[IndicatorType.MACD_LONG], cross_state=None)},
+    ],
+    ids=["rsi-cross", "stochastic-over", "stochastic-cross", "macd-short", "macd-mid", "macd-long"],
+)
+def test_no_loss_relaxed_add_without_each_condition(drop: object) -> None:
+    states = drop(_relaxed_states())  # type: ignore[operator]
+
+    assert not relaxed_add_conditions(states)
+    assert _decide_add(states, "98") is None
+
+
+def test_no_loss_relaxed_add_when_adds_used_up() -> None:
+    assert _decide_add(_relaxed_states(), "98", can_add=False) is None
+
+
+def test_deferred_stop_loss_does_not_sell() -> None:
+    # 추가 매수가 남아 있으면 손절 기준(-3%) 아래여도 팔지 않고, 조건이 맞으면 추가 매수한다
+    assert _decide_add({}, "96", deferred=True) is None
+    assert _decide_add(_relaxed_states(), "96", deferred=True) == ADD
+
+
+def test_stop_loss_when_not_deferred() -> None:
+    assert _decide_add(_relaxed_states(), "96") == Decision(action=Action.SELL, reason=Reason.STOP_LOSS)
+
+
+def test_deferred_stop_loss_keeps_take_profit_and_signal_exits() -> None:
+    assert _decide_add({}, "101.6", deferred=True) == Decision(action=Action.SELL, reason=Reason.TAKE_PROFIT)
+    assert _decide_add(_overbought_states(), "96", deferred=True) == Decision(
+        action=Action.SELL, reason=Reason.OVERBOUGHT_EXIT
+    )
+
+
+# ---------------------------------------------------------------------------
+# MACD 3종 데드크로스 손절 (고정 % 손절 대신)
+# ---------------------------------------------------------------------------
+
+MACD_STOP = Decision(action=Action.SELL, reason=Reason.STOP_LOSS)
+
+
+def _macd_dead() -> dict[IndicatorType, IndicatorInfo]:
+    return {t: _with(_info(t), cross=CrossState.DEAD_CROSS) for t in MACD_TYPES}
+
+
+def _decide_macd_stop(
+    states: dict[IndicatorType, IndicatorInfo], close: str, *, deferred: bool = False, can_add: bool = False
+) -> Decision | None:
+    return decide(
+        states=states,
+        holding=HOLDING,
+        candle_time=T0,
+        close=Decimal(close),
+        exit_settings=EXIT,
+        stochastic_entry_max=50.0,
+        sell_fee_rate=NO_FEE,
+        can_add=can_add,
+        add_buy_trigger=AddBuyTrigger.LOSS_RELAXED,
+        stop_loss_deferred=deferred,
+        stop_loss_by=StopLossBy.MACD_DEAD_CROSS,
+    )
+
+
+@pytest.mark.parametrize("close", ["90", "96", "99", "100.5", "101.4"])
+def test_macd_stop_sells_when_all_three_dead_regardless_of_profit(close: str) -> None:
+    assert _decide_macd_stop(_macd_dead(), close) == MACD_STOP
+
+
+@pytest.mark.parametrize("close", ["90", "50"])
+def test_macd_stop_ignores_fixed_rate(close: str) -> None:
+    # 고정 % 손절은 하지 않는다. MACD가 모두 꺾이기 전에는 크게 떨어져도 들고 있다
+    assert _decide_macd_stop({}, close) is None
+
+
+@pytest.mark.parametrize("alive", MACD_TYPES)
+def test_no_macd_stop_unless_all_three_dead(alive: IndicatorType) -> None:
+    states = _macd_dead() | {alive: _with(_info(alive), cross=CrossState.GOLDEN_CROSS)}
+
+    assert _decide_macd_stop(states, "96") is None
+
+
+def test_macd_stop_waits_while_adds_left() -> None:
+    assert _decide_macd_stop(_macd_dead(), "96", deferred=True) is None
+
+
+def test_signal_exits_come_before_macd_stop() -> None:
+    assert _decide_macd_stop(_macd_dead() | _overbought_states(), "96") == Decision(
+        action=Action.SELL, reason=Reason.OVERBOUGHT_EXIT
+    )
+    assert _decide_macd_stop(_macd_dead() | _dead_cross_states(), "100.6") == Decision(
+        action=Action.SELL, reason=Reason.DEAD_CROSS_EXIT
+    )
+
+
+def test_take_profit_still_applies_with_macd_stop() -> None:
+    assert _decide_macd_stop({}, "101.6") == Decision(action=Action.SELL, reason=Reason.TAKE_PROFIT)
+
+
+def test_rate_stop_is_default() -> None:
+    assert _decide_add({}, "96") == Decision(action=Action.SELL, reason=Reason.STOP_LOSS)

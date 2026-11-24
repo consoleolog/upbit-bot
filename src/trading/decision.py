@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
 
-from src.app.config import ExitSettings
+from src.app.config import AddBuyTrigger, ExitSettings, StopLossBy
 from src.repositories.models import IndicatorInfo, IndicatorType
 from src.trading.reasons import Action, Reason
 from src.trading.signals import CrossState, OverState
@@ -35,6 +35,9 @@ def net_profit_rate(*, price: Decimal, average_price: Decimal, sell_fee_rate: De
     return (price * (1 - sell_fee_rate) - average_price) / average_price * 100
 
 
+_MACD_TYPES = (IndicatorType.MACD_SHORT, IndicatorType.MACD_MID, IndicatorType.MACD_LONG)
+
+
 def decide(
     *,
     states: Mapping[IndicatorType, IndicatorInfo],
@@ -45,11 +48,18 @@ def decide(
     stochastic_entry_max: float,
     sell_fee_rate: Decimal,
     can_add: bool = False,
+    add_buy_trigger: AddBuyTrigger = AddBuyTrigger.ENTRY,
+    stop_loss_deferred: bool = False,
+    stop_loss_by: StopLossBy = StopLossBy.RATE,
 ) -> Decision | None:
     """판단 순서대로 처음 충족한 매수·매도를 돌려준다. 해당하는 것이 없으면 None (매매 로직 5.1).
 
     판단할 캔들은 candle_time(시작 시각)이고 close는 그 캔들의 종가다.
     보유 중이면 손절 → 익절 → 과매수 매도 → 데드크로스 매도 → (can_add면) 추가 매수, 미보유면 신규 매수만 본다.
+    stop_loss_deferred면 손절하지 않는다 (추가 매수가 남아 있어 복구를 기다릴 때).
+    손절은 stop_loss_by에 따른다: RATE는 순수익률이 손절 기준 이하일 때(맨 먼저 판단),
+    MACD_DEAD_CROSS는 MACD 3종이 모두 데드크로스일 때(신호 매도 다음, 추가 매수 전에 판단, 수익과 무관).
+    추가 매수 조건은 add_buy_trigger에 따른다: ENTRY는 신규 매수와 같은 9개, LOSS_RELAXED는 손실 중 완화된 6개.
     신호 상태가 빠져 있거나 다른 캔들 기준이면 그 상태가 필요한 조건은 충족하지 않은 것으로 본다
     (판단할 수 없으면 사지도 팔지도 않음). 손절·익절은 신호 상태가 필요 없으므로 그대로 판단한다.
     """
@@ -64,7 +74,7 @@ def decide(
     if holding is None:
         return Decision(action=Action.BUY, reason=Reason.ENTRY) if _entry(states, stochastic_entry_max) else None
     rate = net_profit_rate(price=close, average_price=holding.average_price, sell_fee_rate=sell_fee_rate)
-    if rate <= -exit_settings.stop_loss_rate:
+    if stop_loss_by is StopLossBy.RATE and rate <= -exit_settings.stop_loss_rate and not stop_loss_deferred:
         return Decision(action=Action.SELL, reason=Reason.STOP_LOSS)
     if rate >= exit_settings.take_profit_rate:
         return Decision(action=Action.SELL, reason=Reason.TAKE_PROFIT)
@@ -80,9 +90,22 @@ def decide(
         and _cross(states, IndicatorType.RSI, CrossState.DEAD_CROSS)
     ):
         return Decision(action=Action.SELL, reason=Reason.DEAD_CROSS_EXIT)
-    # 팔지 않으면, 신규 매수와 같은 조건으로 추가 매수한다. 횟수 한도는 호출하는 쪽이 can_add로 알려 준다 (매매 로직 5.6)
-    if can_add and _entry(states, stochastic_entry_max):
-        return Decision(action=Action.BUY, reason=Reason.ADD)
+    # MACD 손절: 단기·중기·장기가 모두 데드크로스면 하락 추세로 보고 판다 (손실이면 손절, 수익이면 익절이 된다)
+    if (
+        stop_loss_by is StopLossBy.MACD_DEAD_CROSS
+        and not stop_loss_deferred
+        and all(_cross(states, t, CrossState.DEAD_CROSS) for t in _MACD_TYPES)
+    ):
+        return Decision(action=Action.SELL, reason=Reason.STOP_LOSS)
+    # 팔지 않으면 추가 매수를 본다. 횟수 한도는 호출하는 쪽이 can_add로 알려 준다 (매매 로직 5.6)
+    if can_add:
+        if add_buy_trigger is AddBuyTrigger.LOSS_RELAXED:
+            # 손실 중일 때만, 완화된 조건으로 사서 평단을 낮춰 복구를 노린다
+            add = rate < 0 and relaxed_add_conditions(states)
+        else:
+            add = _entry(states, stochastic_entry_max)
+        if add:
+            return Decision(action=Action.BUY, reason=Reason.ADD)
     return None
 
 
@@ -107,6 +130,22 @@ def entry_conditions(states: Mapping[IndicatorType, IndicatorInfo], stochastic_e
         _cross(states, IndicatorType.MACD_LONG, golden),
         k is not None and k <= stochastic_entry_max,
         d is not None and d <= stochastic_entry_max,
+    )
+
+
+def relaxed_add_conditions(states: Mapping[IndicatorType, IndicatorInfo]) -> bool:
+    """완화된 추가 매수 6개 조건 (숫자 저장소): RSI 골든크로스, 스토캐스틱 과매도·골든크로스, MACD 3종 골든크로스.
+
+    신규 매수 조건에서 RSI 과매도와 %K·%D 기준 이하를 뺀 것이다.
+    """
+    golden = CrossState.GOLDEN_CROSS
+    return (
+        _cross(states, IndicatorType.RSI, golden)
+        and _over(states, IndicatorType.STOCHASTIC, OverState.OVER_SOLD)
+        and _cross(states, IndicatorType.STOCHASTIC, golden)
+        and _cross(states, IndicatorType.MACD_SHORT, golden)
+        and _cross(states, IndicatorType.MACD_MID, golden)
+        and _cross(states, IndicatorType.MACD_LONG, golden)
     )
 
 
