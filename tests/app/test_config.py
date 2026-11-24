@@ -306,13 +306,7 @@ def test_paper_config_differs_from_live_only_in_markets_add_buy_and_timeframe() 
             markets=live.markets,
             live=live.live,
             timeframe=live.timeframe,
-            order=replace(
-                paper.order,
-                add_buy_base=live.order.add_buy_base,
-                add_buy_trigger=live.order.add_buy_trigger,
-                stop_loss_after_adds=live.order.stop_loss_after_adds,
-                stop_loss_by=live.order.stop_loss_by,
-            ),
+            order=replace(paper.order, add_buy_base=live.order.add_buy_base),
         )
         == live
     )
@@ -355,7 +349,7 @@ def test_loss_recovery_off_by_default() -> None:
     )
 
 
-@pytest.mark.parametrize("path", [REPO_CONFIG.with_name("trading.paper.json")], ids=["paper"])
+@pytest.mark.parametrize("path", [REPO_CONFIG, REPO_CONFIG.with_name("trading.paper.json")], ids=["live", "paper"])
 def test_repository_configs_use_loss_recovery_and_macd_stop(path: Path) -> None:
     # 손실 중 완화된 조건으로 추가 매수하고, 추가 매수를 다 쓴 뒤 MACD 3종 데드크로스로 손절한다 (고정 % 손절 없음)
     order = load_config(path).order
