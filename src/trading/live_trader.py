@@ -71,8 +71,12 @@ class LiveTrader:
         candle: Candle,
         states: Mapping[IndicatorType, IndicatorInfo],
         allow_buy: bool,
+        entry_allowed: bool = True,
     ) -> None:
-        """방금 마감된 candle에서 매매를 판단해 주문한다. allow_buy가 False면 매수하지 않는다 (매매 로직 3.0)."""
+        """방금 마감된 candle에서 매매를 판단해 주문한다. allow_buy가 False면 매수하지 않는다 (매매 로직 3.0).
+
+        entry_allowed가 False면(스테이지 필터) 신규 매수만 하지 않는다. 추가 매수와 매도는 그대로 판단한다.
+        """
         if await self._blocked(market, market_id):
             return
         position = await self._open_position(market_id)
@@ -92,6 +96,7 @@ class LiveTrader:
             add_buy_trigger=self._order.add_buy_trigger,
             stop_loss_deferred=deferred,
             stop_loss_by=self._order.stop_loss_by,
+            entry_allowed=entry_allowed,
         )
         if decision is None:
             return

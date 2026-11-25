@@ -6,13 +6,13 @@ from datetime import datetime
 from typing import Protocol
 
 from src.app.application import Job
-from src.app.config import ExitSettings, OrderSettings, Timeframe
+from src.app.config import ExitSettings, OrderSettings, StageFilterSettings, Timeframe
 from src.connections.database import Database
 from src.exchange.candle import Candle
 from src.exchange.retry import retry_read
 from src.repositories.indicator_info import IndicatorInfoRepository
 from src.repositories.models import IndicatorInfo, IndicatorType
-from src.trading.indicators import Indicators, IndicatorSettings, Line, calculate
+from src.trading.indicators import Indicators, IndicatorSettings, Line, calculate, ema_stage
 from src.trading.live_trader import LiveTrader
 from src.trading.paper import apply_paper_decision
 from src.trading.signals import CrossState, SignalSettings, Threshold, cross, over
@@ -47,6 +47,7 @@ class MarketWorker:
         market_ids: Mapping[str, int],
         order_settings: OrderSettings,
         live: LiveTrader | None = None,
+        stage_filter: StageFilterSettings | None = None,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
         self._upbit = upbit
@@ -63,6 +64,8 @@ class MarketWorker:
         self._live = live
         # 모의 실행의 추가 매수 배수·횟수 한도 (매매 로직 5.6)
         self._order_settings = order_settings
+        # 있으면 마감된 캔들의 3중 EMA 스테이지가 막는 스테이지일 때 신규 매수하지 않는다
+        self._stage_filter = stage_filter
         self._indicator_infos = IndicatorInfoRepository()
 
     def candle_close_job(self, market: str, close: datetime) -> Job:
@@ -93,6 +96,11 @@ class MarketWorker:
                 expected.isoformat(),
                 candles[-1].start.isoformat(),
             )
+        stage = None
+        if self._stage_filter is not None:
+            f = self._stage_filter
+            stage = ema_stage([candle.close for candle in candles], f.ema_short, f.ema_mid, f.ema_long)
+        entry_allowed = self._stage_filter is None or self._stage_filter.allows(stage)
         async with self._database.transaction() as conn:
             previous = await self._indicator_infos.list_by_market(conn, market_id)
             result = replay(
@@ -116,6 +124,7 @@ class MarketWorker:
                     stochastic_entry_max=self._stochastic_entry_max,
                     allow_buy=len(candles) >= MIN_CANDLES_FOR_SIGNAL,
                     order_settings=self._order_settings,
+                    entry_allowed=entry_allowed,
                 )
         if saved and self._live is not None:
             # 실거래는 거래소를 호출하므로 지표·신호를 커밋한 뒤 트랜잭션 밖에서 판단한다
@@ -125,18 +134,22 @@ class MarketWorker:
                 candle=candles[-1],
                 states={info.indicator_type: info for info in result.infos},
                 allow_buy=len(candles) >= MIN_CANDLES_FOR_SIGNAL,
+                entry_allowed=entry_allowed,
             )
         # 커밋된 뒤에 기록한다
         if result.reset:
             logger.warning("missed more than %d candles; signal states reset (market=%s)", MAX_MISSED_CANDLES, market)
         logger.info(
-            "candle close (market=%s, close=%s, candles=%d, last=%s, judged=%d, saved=%d) %s",
+            "candle close (market=%s, close=%s, candles=%d, last=%s, judged=%d, saved=%d, "
+            "stage=%s, entry_allowed=%s) %s",
             market,
             close.isoformat(),
             len(candles),
             candles[-1].start_kst.isoformat(),
             result.judged,
             len(saved),
+            stage,
+            entry_allowed,
             " ".join(_describe(info) for info in saved),
         )
         if trade is not None:

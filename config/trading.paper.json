@@ -26,5 +26,9 @@
     "take_profit_rate": 1000,
     "stop_loss_rate": 7,
     "min_profit_rate": 0
+  },
+  "stage_filter": {
+    "ema": { "short": 20, "mid": 50, "long": 100 },
+    "block_stages": [4]
   }
 }

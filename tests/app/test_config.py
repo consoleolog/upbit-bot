@@ -12,6 +12,7 @@ from src.app.config import (
     ConfigError,
     ExitSettings,
     OrderSettings,
+    StageFilterSettings,
     StopLossBy,
     Timeframe,
     TradingConfig,
@@ -383,3 +384,60 @@ def test_stop_loss_by_is_read(tmp_path: Path, value: str, expected: StopLossBy) 
 def test_invalid_stop_loss_by_rejected(tmp_path: Path, value: object) -> None:
     with pytest.raises(ConfigError, match=r"order\.stop_loss_by"):
         load_config(_write(tmp_path, _with(("order", "stop_loss_by"), value)))
+
+
+# ---------------------------------------------------------------------------
+# 신규 매수 스테이지 필터
+# ---------------------------------------------------------------------------
+
+STAGE_FILTER = {"ema": {"short": 20, "mid": 50, "long": 100}, "block_stages": [4]}
+
+
+def test_stage_filter_off_by_default(tmp_path: Path) -> None:
+    assert load_config(_write(tmp_path, FULL)).stage_filter is None
+
+
+def test_stage_filter_is_read(tmp_path: Path) -> None:
+    config = load_config(_write(tmp_path, _with(("stage_filter",), STAGE_FILTER)))
+
+    assert config.stage_filter == StageFilterSettings(
+        ema_short=20, ema_mid=50, ema_long=100, block_stages=frozenset({4})
+    )
+
+
+@pytest.mark.parametrize(
+    ("value", "message"),
+    [
+        ([], "stage_filter must be a JSON object"),
+        ({"ema": {"short": 20, "mid": 50, "long": 100}}, "must have ema and block_stages"),
+        ({"block_stages": [4]}, "must have ema and block_stages"),
+        (STAGE_FILTER | {"block": [4]}, "unknown keys in stage_filter"),
+        (STAGE_FILTER | {"ema": {"short": 20, "mid": 50}}, "must have short, mid and long"),
+        (STAGE_FILTER | {"ema": {"short": 20, "mid": 50, "long": 100.0}}, "integer"),
+        (STAGE_FILTER | {"ema": {"short": 50, "mid": 20, "long": 100}}, "short < mid < long"),
+        (STAGE_FILTER | {"ema": {"short": 0, "mid": 50, "long": 100}}, "positive integers"),
+        (STAGE_FILTER | {"block_stages": []}, "non-empty subset"),
+        (STAGE_FILTER | {"block_stages": [7]}, "non-empty subset"),
+        (STAGE_FILTER | {"block_stages": 4}, "list of integers"),
+        (STAGE_FILTER | {"block_stages": [True]}, "list of integers"),
+        (STAGE_FILTER | {"block_stages": ["4"]}, "list of integers"),
+    ],
+)
+def test_invalid_stage_filter_rejected(tmp_path: Path, value: object, message: str) -> None:
+    with pytest.raises(ConfigError, match=message):
+        load_config(_write(tmp_path, _with(("stage_filter",), value)))
+
+
+@pytest.mark.parametrize(("stage", "allowed"), [(None, True), (0, True), (1, True), (3, True), (4, False), (5, True)])
+def test_stage_filter_blocks_only_listed_stages(stage: int | None, allowed: bool) -> None:
+    settings = StageFilterSettings(ema_short=20, ema_mid=50, ema_long=100, block_stages=frozenset({4}))
+
+    assert settings.allows(stage) is allowed
+
+
+@pytest.mark.parametrize("path", [REPO_CONFIG, PAPER_CONFIG], ids=["live", "paper"])
+def test_repository_configs_block_entry_in_long_downtrend(path: Path) -> None:
+    # 30분봉 EMA 20/50/100이 장 > 중 > 단(스테이지 4, 안정적인 하락)이면 신규 매수하지 않는다
+    assert load_config(path).stage_filter == StageFilterSettings(
+        ema_short=20, ema_mid=50, ema_long=100, block_stages=frozenset({4})
+    )

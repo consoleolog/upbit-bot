@@ -93,6 +93,34 @@ def macd(closes: Sequence[Decimal], fast: int, slow: int, signal: int) -> Line:
     return Line(main=_series(main), signal=_series(talib.EMA(main, signal)))
 
 
+def ema_stage(closes: Sequence[Decimal], short: int, mid: int, long: int) -> int | None:
+    """마지막 캔들의 3중 EMA 스테이지. EMA 단기·중기·장기를 위에서 아래 순서로 본다.
+
+    1: 단 > 중 > 장 (안정적인 상승), 2: 중 > 단 > 장 (상승의 끝), 3: 중 > 장 > 단 (하락의 시작),
+    4: 장 > 중 > 단 (안정적인 하락), 5: 장 > 단 > 중 (하락의 끝), 6: 단 > 장 > 중 (상승의 시작).
+    두 값이 같으면 0이다 (숫자 저장소 get_stage와 같다). 캔들이 long개보다 적어 계산할 수 없으면 None.
+    """
+    if not 1 <= short < mid < long:
+        raise ValueError(f"periods must satisfy 1 <= short < mid < long: {short}, {mid}, {long}")
+    if len(closes) < long:
+        return None
+    values = _floats(closes)
+    s, m, lo = (float(talib.EMA(values, period)[-1]) for period in (short, mid, long))
+    if s > m > lo:
+        return 1
+    if m > s > lo:
+        return 2
+    if m > lo > s:
+        return 3
+    if lo > m > s:
+        return 4
+    if lo > s > m:
+        return 5
+    if s > lo > m:
+        return 6
+    return 0
+
+
 def rsi(closes: Sequence[Decimal], period: int, signal: int) -> Line:
     """Wilder 방식 RSI와 시그널 = RSI의 EMA(signal) (매매 로직 3.2).
 
