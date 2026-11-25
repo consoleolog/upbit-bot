@@ -104,6 +104,39 @@ class ExitSettings:
     min_profit_rate: Decimal = Decimal("0.5")
 
 
+# 3중 EMA 스테이지 값 (src.trading.indicators.ema_stage). 0은 두 EMA가 같은 경우다
+EMA_STAGES = frozenset(range(7))
+
+
+@dataclass(frozen=True, kw_only=True)
+class StageFilterSettings:
+    """신규 매수 스테이지 필터. 마감된 캔들의 3중 EMA 스테이지가 block_stages면 신규 매수하지 않는다.
+
+    추가 매수와 매도에는 적용하지 않는다. 막힌 매수 신호는 신호 상태를 비우지 않으므로,
+    스테이지가 바뀐 뒤 조건이 계속 맞으면 그때 매수한다.
+    """
+
+    ema_short: int
+    ema_mid: int
+    ema_long: int
+    block_stages: frozenset[int]
+
+    def __post_init__(self) -> None:
+        periods = (self.ema_short, self.ema_mid, self.ema_long)
+        if any(not isinstance(p, int) or isinstance(p, bool) or p < 1 for p in periods):
+            raise ValueError(f"stage_filter ema periods must be positive integers: {periods}")
+        if not self.ema_short < self.ema_mid < self.ema_long:
+            raise ValueError(f"stage_filter ema periods must satisfy short < mid < long: {periods}")
+        if not self.block_stages or not self.block_stages <= EMA_STAGES:
+            raise ValueError(
+                f"stage_filter.block_stages must be a non-empty subset of 0..6: {sorted(self.block_stages)}"
+            )
+
+    def allows(self, stage: int | None) -> bool:
+        """그 스테이지에서 신규 매수를 해도 되는지. 계산할 수 없으면(None) 막지 않는다 (짧은 구간은 매수 자체를 하지 않는다)."""
+        return stage is None or stage not in self.block_stages
+
+
 @dataclass(frozen=True, kw_only=True)
 class TradingConfig:
     """매매 설정 (매매 로직 2). 항목을 빼면 매매 로직 2.1의 기본값을 쓴다."""
@@ -116,6 +149,8 @@ class TradingConfig:
     stochastic_entry_max: float = 50.0
     order: OrderSettings = field(default_factory=OrderSettings)
     exit: ExitSettings = field(default_factory=ExitSettings)
+    # 없으면 스테이지와 상관없이 신규 매수한다
+    stage_filter: StageFilterSettings | None = None
     # True면 업비트에 실제 주문을 낸다. 기본은 모의 실행이다. 모의 실행과 실거래는 신호 상태를 함께 쓰므로 둘 중 하나만 한다
     live: bool = False
 
@@ -128,7 +163,9 @@ def load_config(path: Path) -> TradingConfig:
         raise ConfigError(f"cannot read config file: {path}") from error
     except json.JSONDecodeError as error:
         raise ConfigError(f"config file is not valid JSON: {path}") from error
-    root = _object(raw, "config", {"timeframe", "markets", "indicator", "threshold", "order", "exit", "live"})
+    root = _object(
+        raw, "config", {"timeframe", "markets", "indicator", "threshold", "order", "exit", "stage_filter", "live"}
+    )
     indicator = _object(root.get("indicator", {}), "indicator", {"ema", "macd_signal", "rsi", "stochastic"})
     threshold = _object(root.get("threshold", {}), "threshold", {"rsi", "stochastic", "stochastic_entry_max"})
     order = _object(
@@ -158,6 +195,7 @@ def load_config(path: Path) -> TradingConfig:
             stochastic_entry_max=_percent(threshold, "stochastic_entry_max", 50.0),
             order=_parse_order(order),
             exit=_parse_exit(exit_),
+            stage_filter=_parse_stage_filter(root["stage_filter"]) if "stage_filter" in root else None,
             live=_parse_live(root.get("live", False)),
         )
     except ConfigError:
@@ -289,6 +327,24 @@ def _parse_order(section: Mapping[str, object]) -> OrderSettings:
         add_buy_trigger=AddBuyTrigger(trigger),
         stop_loss_after_adds=stop_after_adds,
         stop_loss_by=StopLossBy(stop_by),
+    )
+
+
+def _parse_stage_filter(value: object) -> StageFilterSettings:
+    section = _object(value, "stage_filter", {"ema", "block_stages"})
+    if "ema" not in section or "block_stages" not in section:
+        raise ConfigError("stage_filter must have ema and block_stages")
+    ema = _object(section["ema"], "stage_filter.ema", {"short", "mid", "long"})
+    if set(ema) != {"short", "mid", "long"}:
+        raise ConfigError("stage_filter.ema must have short, mid and long")
+    stages = section["block_stages"]
+    if not isinstance(stages, list) or any(isinstance(s, bool) or not isinstance(s, int) for s in stages):
+        raise ConfigError(f"stage_filter.block_stages must be a list of integers: {stages!r}")
+    return StageFilterSettings(
+        ema_short=_integer(ema, "short", "stage_filter.ema.short", 0),
+        ema_mid=_integer(ema, "mid", "stage_filter.ema.mid", 0),
+        ema_long=_integer(ema, "long", "stage_filter.ema.long", 0),
+        block_stages=frozenset(stages),
     )
 
 

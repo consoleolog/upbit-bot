@@ -156,13 +156,16 @@ class Env:
             # 추가 매수를 한 포지션으로 만든다
             await conn.execute("UPDATE position SET buy_count = $2 WHERE market_id = $1", self.market_id, buys)
 
-    async def candle(self, close: str, *, allow_buy: bool = True, start: datetime = T0) -> None:
+    async def candle(
+        self, close: str, *, allow_buy: bool = True, start: datetime = T0, entry_allowed: bool = True
+    ) -> None:
         await self.trader.on_candle(
             self.market,
             self.market_id,
             candle=_candle(self.market, close, start),
             states=_entry_states(self.market_id, start),
             allow_buy=allow_buy,
+            entry_allowed=entry_allowed,
         )
 
     async def tick(self, price: str, seconds: int = 1) -> None:
@@ -350,6 +353,24 @@ async def test_buys_in_different_markets_run_one_at_a_time(env: Env) -> None:
     await asyncio.wait_for(asyncio.gather(first, second), timeout=5)
     assert env.accounts.calls == 2
     assert [market for market, _ in env.executor.buys] == [env.market, other]
+
+
+async def test_no_new_buy_when_stage_filter_blocks(env: Env) -> None:
+    # 스테이지 필터가 막으면 신규 매수하지 않고, 잔고도 조회하지 않는다
+    await env.candle("100000000", entry_allowed=False)
+
+    assert env.executor.buys == []
+    assert env.accounts.calls == 0
+
+
+async def test_stage_filter_does_not_block_add_buy(env: Env) -> None:
+    # 필터는 신규 매수에만 적용한다
+    await env.hold()
+
+    await env.candle("99000000", entry_allowed=False)
+
+    assert env.executor.buys == [(env.market, Decimal("15000"))]
+    assert env.executor.buy_reasons == [Reason.ADD]
 
 
 # ---------------------------------------------------------------------------

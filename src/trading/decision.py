@@ -51,6 +51,7 @@ def decide(
     add_buy_trigger: AddBuyTrigger = AddBuyTrigger.ENTRY,
     stop_loss_deferred: bool = False,
     stop_loss_by: StopLossBy = StopLossBy.RATE,
+    entry_allowed: bool = True,
 ) -> Decision | None:
     """판단 순서대로 처음 충족한 매수·매도를 돌려준다. 해당하는 것이 없으면 None (매매 로직 5.1).
 
@@ -60,6 +61,7 @@ def decide(
     손절은 stop_loss_by에 따른다: RATE는 순수익률이 손절 기준 이하일 때(맨 먼저 판단),
     MACD_DEAD_CROSS는 MACD 3종이 모두 데드크로스일 때(신호 매도 다음, 추가 매수 전에 판단, 수익과 무관).
     추가 매수 조건은 add_buy_trigger에 따른다: ENTRY는 신규 매수와 같은 9개, LOSS_RELAXED는 손실 중 완화된 6개.
+    entry_allowed가 False면 신규 매수만 하지 않는다 (스테이지 필터). 추가 매수와 매도는 그대로 판단한다.
     신호 상태가 빠져 있거나 다른 캔들 기준이면 그 상태가 필요한 조건은 충족하지 않은 것으로 본다
     (판단할 수 없으면 사지도 팔지도 않음). 손절·익절은 신호 상태가 필요 없으므로 그대로 판단한다.
     """
@@ -72,6 +74,8 @@ def decide(
     # 업비트 반영 지연 등으로 이전 캔들의 상태가 넘어와도 지난 값과 신호로 사고팔지 않게 한다
     states = {t: info for t, info in states.items() if info.candle_time == candle_time}
     if holding is None:
+        if not entry_allowed:
+            return None
         return Decision(action=Action.BUY, reason=Reason.ENTRY) if _entry(states, stochastic_entry_max) else None
     rate = net_profit_rate(price=close, average_price=holding.average_price, sell_fee_rate=sell_fee_rate)
     if stop_loss_by is StopLossBy.RATE and rate <= -exit_settings.stop_loss_rate and not stop_loss_deferred:

@@ -8,7 +8,7 @@ from unittest.mock import MagicMock
 import pytest
 from pytest_mock import MockerFixture
 
-from src.app.config import ExitSettings, OrderSettings, Timeframe
+from src.app.config import ExitSettings, OrderSettings, StageFilterSettings, Timeframe
 from src.connections.database import Database
 from src.exchange.candle import Candle
 from src.exchange.upbit_client import UpbitConnectionError
@@ -16,7 +16,7 @@ from src.repositories.indicator_info import IndicatorInfoRepository
 from src.repositories.market import MarketRepository
 from src.repositories.models import IndicatorInfo, IndicatorType
 from src.trading.decision import Action, Decision, Reason
-from src.trading.indicators import Indicators, IndicatorSettings, Line, calculate
+from src.trading.indicators import Indicators, IndicatorSettings, Line, calculate, ema_stage
 from src.trading.market_worker import (
     MAX_MISSED_CANDLES,
     MIN_CANDLES_FOR_SIGNAL,
@@ -344,7 +344,11 @@ def test_replay_already_processed_does_nothing(offset: int) -> None:
 
 
 def _worker(
-    upbit: FakeUpbit, database: Database, market_ids: dict[str, int], sleeps: list[float] | None = None
+    upbit: FakeUpbit,
+    database: Database,
+    market_ids: dict[str, int],
+    sleeps: list[float] | None = None,
+    stage_filter: StageFilterSettings | None = None,
 ) -> MarketWorker:
     async def sleep(seconds: float) -> None:
         if sleeps is not None:
@@ -361,6 +365,7 @@ def _worker(
         stochastic_entry_max=50.0,
         order_settings=OrderSettings(),
         market_ids=market_ids,
+        stage_filter=stage_filter,
     )
 
 
@@ -549,6 +554,35 @@ async def test_job_judges_paper_trade_once_on_latest_candle(
     kwargs = apply.await_args.kwargs
     assert (kwargs["market_id"], kwargs["candle"], kwargs["allow_buy"]) == (market_id, candles[-1], True)
     assert kwargs["states"] == await _saved(database, market_id)
+    # 스테이지 필터가 없으면 신규 매수를 막지 않는다
+    assert kwargs["entry_allowed"] is True
+
+
+def _stage_filter(block: int) -> StageFilterSettings:
+    return StageFilterSettings(ema_short=20, ema_mid=50, ema_long=100, block_stages=frozenset({block}))
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("blocked", [True, False])
+async def test_job_passes_stage_filter_result(
+    database: Database, market: tuple[str, int], mocker: MockerFixture, caplog: pytest.LogCaptureFixture, blocked: bool
+) -> None:
+    caplog.set_level("INFO")
+    symbol, market_id = market
+    candles = _candles(symbol, 200, CLOSE)
+    # 받은 캔들의 종가로 계산한 마지막 캔들의 스테이지
+    stage = ema_stage([candle.close for candle in candles], 20, 50, 100)
+    assert stage is not None
+    apply = mocker.patch("src.trading.market_worker.apply_paper_decision", new_callable=mocker.AsyncMock)
+    apply.return_value = None
+    stage_filter = _stage_filter(stage if blocked else (stage + 1) % 7)
+
+    await _worker(FakeUpbit(candles), database, {symbol: market_id}, stage_filter=stage_filter).candle_close_job(
+        symbol, CLOSE
+    )()
+
+    assert apply.await_args.kwargs["entry_allowed"] is (not blocked)
+    assert f"stage={stage}, entry_allowed={not blocked}" in caplog.text
 
 
 @pytest.mark.integration
@@ -587,6 +621,7 @@ class FakeLive:
     def __init__(self, database: Database) -> None:
         self.database = database
         self.calls: list[tuple[str, int, Candle, bool]] = []
+        self.entry_allowed: list[bool] = []
         self.committed: list[bool] = []
 
     async def on_candle(
@@ -597,8 +632,10 @@ class FakeLive:
         candle: Candle,
         states: dict[IndicatorType, IndicatorInfo],
         allow_buy: bool,
+        entry_allowed: bool,
     ) -> None:
         self.calls.append((market, market_id, candle, allow_buy))
+        self.entry_allowed.append(entry_allowed)
         # 다른 커넥션에서 보이면 커밋된 것이다. 거래소를 호출하는 판단은 트랜잭션 밖에서 해야 한다
         self.committed.append(await _saved(self.database, market_id) == states)
 
@@ -630,6 +667,8 @@ async def test_live_judges_after_commit_instead_of_paper(
     await worker.candle_close_job(symbol, close)()
 
     assert live.calls == [(symbol, market_id, candles[-1], True)]
+    # 스테이지 필터가 없으면 신규 매수를 막지 않는다
+    assert live.entry_allowed == [True]
     assert live.committed == [True]
     # 실거래일 때는 모의 실행으로 판단하지 않는다. 둘 다 하면 서로의 신호 상태를 지운다
     paper.assert_not_awaited()

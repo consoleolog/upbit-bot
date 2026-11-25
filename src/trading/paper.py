@@ -36,11 +36,13 @@ async def apply_paper_decision(
     stochastic_entry_max: float,
     allow_buy: bool,
     order_settings: OrderSettings,
+    entry_allowed: bool = True,
 ) -> PaperTrade | None:
     """candle(방금 마감된 캔들)에서 매매를 판단해 모의 매수·매도를 기록한다. 매매하지 않으면 None.
 
     매수·매도를 기록하면 이 마켓의 신호 상태를 모두 비운다 (매매 로직 7).
     allow_buy가 False면(계산 구간이 짧은 캔들, 매매 로직 3.0) 매수하지 않는다. 손절·익절·신호 매도는 판단한다.
+    entry_allowed가 False면(스테이지 필터) 신규 매수만 하지 않는다. 신호 상태는 비우지 않는다.
     보유 중 매수 신호가 다시 나면 order_settings의 배수·횟수 한도 안에서 추가 매수한다 (매매 로직 5.6).
     exit_settings는 새로 매수할 포지션의 매도 기준이다. 보유 중인 포지션은 매수할 때 저장한 기준을 쓴다 (매매 로직 2.3).
     호출하는 쪽의 트랜잭션 안에서 실행해, 신호 상태 저장과 함께 커밋되게 한다.
@@ -59,6 +61,7 @@ async def apply_paper_decision(
         add_buy_trigger=order_settings.add_buy_trigger,
         stop_loss_deferred=current is not None and order_settings.stop_loss_deferred(current.buy_count),
         stop_loss_by=order_settings.stop_loss_by,
+        entry_allowed=entry_allowed,
     )
     if decision is None:
         return None

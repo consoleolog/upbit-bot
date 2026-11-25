@@ -96,6 +96,7 @@ async def run(
                 market_ids=market_ids,
                 live=live,
                 order_settings=config.order,
+                stage_filter=config.stage_filter,
             )
             scheduler = CandleScheduler(
                 timeframe=config.timeframe,
