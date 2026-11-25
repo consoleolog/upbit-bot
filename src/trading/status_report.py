@@ -15,6 +15,7 @@ from typing import Protocol
 import asyncpg
 
 from src.app.application import Job
+from src.app.config import StageFilterSettings
 from src.app.notifier import Notifier
 from src.connections.database import Database
 from src.exchange.account import Account
@@ -72,6 +73,8 @@ class StatusReporter:
         started_at: datetime,
         balance: BalanceSource | None = None,
         halts: HaltSource | None = None,
+        stage_filter: StageFilterSettings | None = None,
+        stages: Callable[[str], int | None] | None = None,
         clock: Callable[[], datetime],
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
@@ -83,6 +86,9 @@ class StatusReporter:
         self._stochastic_entry_max = stochastic_entry_max
         self._balance = balance
         self._halts = halts
+        # 스테이지 필터가 있으면 마켓별 마지막 스테이지와 신규 매수가 막혔는지 함께 보낸다
+        self._stage_filter = stage_filter
+        self._stages = stages
         self._clock = clock
         self._sleep = sleep
         # 직전 알림 시각. 처음에는 봇이 시작한 시각이다
@@ -165,7 +171,8 @@ class StatusReporter:
             signals = []
             for market, market_id in self._market_ids.items():
                 states = await IndicatorInfoRepository().list_by_market(conn, market_id)
-                signals.append(f"{market} {sum(entry_conditions(states, self._stochastic_entry_max))}/9")
+                count = sum(entry_conditions(states, self._stochastic_entry_max))
+                signals.append(f"{market} {count}/9{self._stage_text(market)}")
         return [
             "보유" if holdings else "보유 없음",
             *(
@@ -174,9 +181,27 @@ class StatusReporter:
             ),
             f"{since_label} 이후",
             f"  {period}",
-            "매수 신호 (9개 조건 중)",
+            f"매수 신호 (9개 조건 중{self._stage_legend()})",
             f"  {' · '.join(signals)}",
         ]
+
+    def _stage_legend(self) -> str:
+        f = self._stage_filter
+        if f is None:
+            return ""
+        return f", S = EMA {f.ema_short}/{f.ema_mid}/{f.ema_long} 스테이지"
+
+    def _stage_text(self, market: str) -> str:
+        """스테이지 필터가 있으면 ' [S2]'처럼 마지막 스테이지를, 신규 매수가 막혔으면 ' [S4 신규 매수 막힘]'을 붙인다."""
+        if self._stage_filter is None:
+            return ""
+        stage = None if self._stages is None else self._stages(market)
+        if stage is None:
+            # 봇이 시작한 뒤 아직 캔들 마감을 처리하지 않았다
+            return " [S?]"
+        if not self._stage_filter.allows(stage):
+            return f" [S{stage} 신규 매수 막힘]"
+        return f" [S{stage}]"
 
     def _return_text(self, market: str, average: Decimal) -> str:
         ticker = self._prices(market)

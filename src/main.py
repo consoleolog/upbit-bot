@@ -127,6 +127,8 @@ async def run(
                 started_at=datetime.now(UTC),
                 balance=upbit if config.live else None,
                 halts=executor,
+                stage_filter=config.stage_filter,
+                stages=worker.latest_stage,
                 clock=lambda: datetime.now(UTC),
             )
             app.add_service("status-report", reporter.run)
