@@ -5,7 +5,7 @@ from itertools import pairwise
 import pytest
 
 from src.exchange.candle import Candle
-from src.trading.indicators import IndicatorSettings, Line, calculate, macd, rsi, stochastic_slow
+from src.trading.indicators import IndicatorSettings, Line, calculate, ema_stage, macd, rsi, stochastic_slow
 
 
 def _ema(values: list[float | None], period: int) -> list[float | None]:
@@ -275,3 +275,47 @@ def test_default_settings_follow_trading_logic() -> None:
 def test_invalid_settings_rejected_on_creation(overrides: dict[str, object]) -> None:
     with pytest.raises(ValueError, match="periods"):
         IndicatorSettings(**overrides)  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------
+# 3중 EMA 스테이지
+# ---------------------------------------------------------------------------
+
+
+def _stage_of(closes: list[float]) -> int | None:
+    return ema_stage(_decimals(closes), 2, 3, 4)
+
+
+def _reference_stage(closes: list[float]) -> int:
+    s, m, lo = (_ema(list(closes), period)[-1] for period in (2, 3, 4))
+    assert s is not None and m is not None and lo is not None
+    order = {1: s > m > lo, 2: m > s > lo, 3: m > lo > s, 4: lo > m > s, 5: lo > s > m, 6: s > lo > m}
+    return next((stage for stage, holds in order.items() if holds), 0)
+
+
+@pytest.mark.parametrize(
+    ("closes", "stage"),
+    [
+        ([10, 11, 12, 13, 14, 15, 16, 17], 1),  # 꾸준히 오름: 단 > 중 > 장
+        ([10, 11, 12, 13, 14, 15, 11, 13], 2),  # 오르다 꺾인 뒤 조금 회복: 중 > 단 > 장
+        ([10, 11, 12, 13, 14, 15, 13, 13], 3),  # 오르다 꺾여 머묾: 중 > 장 > 단
+        ([17, 16, 15, 14, 13, 12, 11, 10], 4),  # 꾸준히 내림: 장 > 중 > 단
+        ([15, 14, 13, 12, 11, 10, 8, 11], 5),  # 내리다 반등: 장 > 단 > 중
+        ([15, 14, 13, 12, 11, 10, 8, 12], 6),  # 내리다 크게 반등: 단 > 장 > 중
+        ([10, 10, 10, 10, 10, 10], 0),  # 모두 같음
+    ],
+)
+def test_ema_stage(closes: list[float], stage: int) -> None:
+    assert _reference_stage(closes) == stage
+    assert _stage_of(closes) == stage
+
+
+def test_ema_stage_needs_long_period_candles() -> None:
+    assert _stage_of([10, 11, 12]) is None
+    assert _stage_of([10, 11, 12, 13]) == 1
+
+
+@pytest.mark.parametrize(("short", "mid", "long"), [(0, 3, 4), (3, 3, 4), (2, 5, 4)])
+def test_ema_stage_rejects_invalid_periods(short: int, mid: int, long: int) -> None:
+    with pytest.raises(ValueError, match="short < mid < long"):
+        ema_stage(_decimals([10] * 10), short, mid, long)

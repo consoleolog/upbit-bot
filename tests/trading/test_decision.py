@@ -556,3 +556,37 @@ def test_take_profit_still_applies_with_macd_stop() -> None:
 
 def test_rate_stop_is_default() -> None:
     assert _decide_add({}, "96") == Decision(action=Action.SELL, reason=Reason.STOP_LOSS)
+
+
+# ---------------------------------------------------------------------------
+# 신규 매수 스테이지 필터 (entry_allowed)
+# ---------------------------------------------------------------------------
+
+
+def _decide_blocked(holding: Holding | None, states: dict[IndicatorType, IndicatorInfo], close: str) -> Decision | None:
+    return decide(
+        states=states,
+        holding=holding,
+        candle_time=T0,
+        close=Decimal(close),
+        exit_settings=EXIT,
+        stochastic_entry_max=50.0,
+        sell_fee_rate=NO_FEE,
+        can_add=True,
+        add_buy_trigger=AddBuyTrigger.LOSS_RELAXED,
+        entry_allowed=False,
+    )
+
+
+def test_entry_not_allowed_blocks_new_buy() -> None:
+    assert _decide(_entry_states()) == BUY
+    assert _decide_blocked(None, _entry_states(), "100") is None
+
+
+def test_entry_not_allowed_keeps_add_buy_and_sells() -> None:
+    # 필터는 신규 매수에만 적용한다. 보유 중의 추가 매수와 매도는 그대로 판단한다
+    assert _decide_blocked(HOLDING, _relaxed_states(), "99") == ADD
+    assert _decide_blocked(HOLDING, {}, "97") == Decision(action=Action.SELL, reason=Reason.STOP_LOSS)
+    assert _decide_blocked(HOLDING, _overbought_states(), "99") == Decision(
+        action=Action.SELL, reason=Reason.OVERBOUGHT_EXIT
+    )
