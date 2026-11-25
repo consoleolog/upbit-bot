@@ -66,7 +66,13 @@ class MarketWorker:
         self._order_settings = order_settings
         # 있으면 마감된 캔들의 3중 EMA 스테이지가 막는 스테이지일 때 신규 매수하지 않는다
         self._stage_filter = stage_filter
+        # 마켓별 마지막으로 계산한 스테이지 (상태 알림용). 봇이 시작한 뒤 아직 계산하지 않았으면 없다
+        self._stages: dict[str, int | None] = {}
         self._indicator_infos = IndicatorInfoRepository()
+
+    def latest_stage(self, market: str) -> int | None:
+        """마지막 캔들 마감 때 계산한 3중 EMA 스테이지. 스테이지 필터가 없거나 아직 계산하지 않았으면 None."""
+        return self._stages.get(market)
 
     def candle_close_job(self, market: str, close: datetime) -> Job:
         """스케줄러에 넘기는 작업. 마켓의 close 시각 캔들 마감을 처리한다."""
@@ -100,6 +106,7 @@ class MarketWorker:
         if self._stage_filter is not None:
             f = self._stage_filter
             stage = ema_stage([candle.close for candle in candles], f.ema_short, f.ema_mid, f.ema_long)
+            self._stages[market] = stage
         entry_allowed = self._stage_filter is None or self._stage_filter.allows(stage)
         async with self._database.transaction() as conn:
             previous = await self._indicator_infos.list_by_market(conn, market_id)
