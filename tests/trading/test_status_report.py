@@ -8,7 +8,7 @@ from decimal import Decimal
 import pytest
 import pytest_asyncio
 
-from src.app.config import ExitSettings
+from src.app.config import ExitSettings, StageFilterSettings
 from src.connections.database import Database
 from src.exchange.account import Account
 from src.exchange.ticker import Ticker
@@ -92,6 +92,8 @@ def _reporter(
     balance: Balance | None = None,
     halts: Halts | None = None,
     notifier: Notifier | None = None,
+    stage_filter: StageFilterSettings | None = None,
+    stages: dict[str, int] | None = None,
 ) -> StatusReporter:
     def price(market: str) -> Ticker | None:
         value = (prices or {}).get(market)
@@ -107,6 +109,8 @@ def _reporter(
         started_at=SINCE,
         balance=balance,
         halts=halts,
+        stage_filter=stage_filter,
+        stages=None if stages is None else stages.get,
         clock=lambda: AT,
         sleep=_no_sleep,
     )
@@ -351,3 +355,30 @@ async def test_run_submits_report_at_each_time_and_moves_window() -> None:
     # 첫 알림은 봇 시작부터, 다음 알림은 직전 알림 시각부터 센다
     assert built == [(AT, AT - timedelta(minutes=30), "봇 시작(11-23 08:30)"), (AT + timedelta(hours=4), AT, "09:00")]
     assert notifier.messages == ["report 1", "report 2"]
+
+
+STAGE_FILTER = StageFilterSettings(ema_short=20, ema_mid=50, ema_long=100, block_stages=frozenset({4}))
+
+
+@pytest.mark.integration
+async def test_report_shows_stage_and_blocked_entry(database: Database, markets: dict[str, int]) -> None:
+    (blocked, _), (allowed, _) = markets.items()
+    reporter = _reporter(database, markets, stage_filter=STAGE_FILTER, stages={blocked: 4, allowed: 2})
+
+    lines = (await reporter.build(AT, SINCE, "05:00")).split("\n")
+
+    assert lines[-2:] == [
+        "매수 신호 (9개 조건 중, S = EMA 20/50/100 스테이지)",
+        f"  {blocked} 0/9 [S4 신규 매수 막힘] · {allowed} 0/9 [S2]",
+    ]
+
+
+@pytest.mark.integration
+async def test_report_shows_unknown_stage_before_first_candle(database: Database, markets: dict[str, int]) -> None:
+    # 봇이 시작한 뒤 아직 캔들 마감을 처리하지 않은 마켓
+    first, second = markets
+    reporter = _reporter(database, markets, stage_filter=STAGE_FILTER, stages={})
+
+    lines = (await reporter.build(AT, SINCE, "05:00")).split("\n")
+
+    assert lines[-1] == f"  {first} 0/9 [S?] · {second} 0/9 [S?]"

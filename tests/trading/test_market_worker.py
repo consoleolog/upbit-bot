@@ -554,8 +554,9 @@ async def test_job_judges_paper_trade_once_on_latest_candle(
     kwargs = apply.await_args.kwargs
     assert (kwargs["market_id"], kwargs["candle"], kwargs["allow_buy"]) == (market_id, candles[-1], True)
     assert kwargs["states"] == await _saved(database, market_id)
-    # 스테이지 필터가 없으면 신규 매수를 막지 않는다
+    # 스테이지 필터가 없으면 신규 매수를 막지 않고, 스테이지도 계산하지 않는다
     assert kwargs["entry_allowed"] is True
+    assert worker.latest_stage(symbol) is None
 
 
 def _stage_filter(block: int) -> StageFilterSettings:
@@ -577,11 +578,14 @@ async def test_job_passes_stage_filter_result(
     apply.return_value = None
     stage_filter = _stage_filter(stage if blocked else (stage + 1) % 7)
 
-    await _worker(FakeUpbit(candles), database, {symbol: market_id}, stage_filter=stage_filter).candle_close_job(
-        symbol, CLOSE
-    )()
+    worker = _worker(FakeUpbit(candles), database, {symbol: market_id}, stage_filter=stage_filter)
+    assert worker.latest_stage(symbol) is None
+
+    await worker.candle_close_job(symbol, CLOSE)()
 
     assert apply.await_args.kwargs["entry_allowed"] is (not blocked)
+    # 상태 알림에서 쓰도록 마지막 스테이지를 기억한다
+    assert worker.latest_stage(symbol) == stage
     assert f"stage={stage}, entry_allowed={not blocked}" in caplog.text
 
 
