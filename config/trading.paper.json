@@ -28,7 +28,7 @@
     "min_profit_rate": 0
   },
   "stage_filter": {
-    "ema": { "short": 20, "mid": 50, "long": 100 },
+    "ema": { "short": 5, "mid": 8, "long": 13 },
     "block_stages": [4]
   }
 }
