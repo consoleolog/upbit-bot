@@ -436,8 +436,9 @@ def test_stage_filter_blocks_only_listed_stages(stage: int | None, allowed: bool
 
 
 @pytest.mark.parametrize("path", [REPO_CONFIG, PAPER_CONFIG], ids=["live", "paper"])
-def test_repository_configs_block_entry_in_long_downtrend(path: Path) -> None:
-    # 30분봉 EMA 20/50/100이 장 > 중 > 단(스테이지 4, 안정적인 하락)이면 신규 매수하지 않는다
+def test_repository_configs_wait_for_rebound_before_entry(path: Path) -> None:
+    # 매수 지표와 같은 EMA 5/8/13이 장 > 중 > 단(스테이지 4)이면 신규 매수하지 않는다
+    # (막힌 신호는 남으므로 단기 EMA가 중기 위로 올라서는 반등을 확인한 뒤 산다)
     assert load_config(path).stage_filter == StageFilterSettings(
-        ema_short=20, ema_mid=50, ema_long=100, block_stages=frozenset({4})
+        ema_short=5, ema_mid=8, ema_long=13, block_stages=frozenset({4})
     )
