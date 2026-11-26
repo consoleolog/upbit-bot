@@ -297,10 +297,10 @@ def test_paper_config_is_paper_with_more_markets_previous_add_buy_and_15m() -> N
     assert paper.order.stop_loss_after_adds is True
 
 
-def test_paper_config_differs_from_live_only_in_markets_add_buy_timeframe_and_stage_filter() -> None:
+def test_paper_config_differs_from_live_only_in_markets_add_buy_and_timeframe() -> None:
     paper, live = load_config(PAPER_CONFIG), load_config(REPO_CONFIG)
 
-    # 마켓, 추가 매수 기준, 캔들 주기, 스테이지 필터 EMA만 다르다. 그 밖의 매매 기준은 실거래와 같아야 비교 시험이 된다
+    # 마켓, 추가 매수 기준, 캔들 주기만 다르다. 그 밖의 매매 기준은 실거래와 같아야 비교 시험이 된다
     assert (
         replace(
             paper,
@@ -308,7 +308,6 @@ def test_paper_config_differs_from_live_only_in_markets_add_buy_timeframe_and_st
             live=live.live,
             timeframe=live.timeframe,
             order=replace(paper.order, add_buy_base=live.order.add_buy_base),
-            stage_filter=live.stage_filter,
         )
         == live
     )
@@ -436,16 +435,10 @@ def test_stage_filter_blocks_only_listed_stages(stage: int | None, allowed: bool
     assert settings.allows(stage) is allowed
 
 
-def test_live_config_blocks_entry_in_long_downtrend() -> None:
-    # 실거래: EMA 20/50/100이 장 > 중 > 단(스테이지 4, 안정적인 하락)이면 신규 매수하지 않는다
-    assert load_config(REPO_CONFIG).stage_filter == StageFilterSettings(
-        ema_short=20, ema_mid=50, ema_long=100, block_stages=frozenset({4})
-    )
-
-
-def test_paper_config_waits_for_rebound_before_entry() -> None:
-    # 모의: 매수 지표와 같은 EMA 5/8/13이 스테이지 4면 신규 매수하지 않는다
+@pytest.mark.parametrize("path", [REPO_CONFIG, PAPER_CONFIG], ids=["live", "paper"])
+def test_repository_configs_wait_for_rebound_before_entry(path: Path) -> None:
+    # 매수 지표와 같은 EMA 5/8/13이 장 > 중 > 단(스테이지 4)이면 신규 매수하지 않는다
     # (막힌 신호는 남으므로 단기 EMA가 중기 위로 올라서는 반등을 확인한 뒤 산다)
-    assert load_config(PAPER_CONFIG).stage_filter == StageFilterSettings(
+    assert load_config(path).stage_filter == StageFilterSettings(
         ema_short=5, ema_mid=8, ema_long=13, block_stages=frozenset({4})
     )
