@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -13,6 +14,16 @@ SCRIPT = ROOT / "scripts" / "watchdog.sh"
 WEBHOOK = "https://discord.com/api/webhooks/123/secret-token-abc"
 T0 = 1_800_000_000
 HEALTHY = "KRW-BTC|35\nKRW-ETH|35\nKRW-SOL|35"
+MARKETS_LINE = re.compile(r'^( *"markets": *)\[.*\](,? *)$', re.MULTILINE)
+
+
+def _config_with_three_markets() -> str:
+    """저장소 설정 파일 형식 그대로, 마켓만 시험용 세 개로 바꾼다 (실거래 마켓이 바뀌어도 시험이 흔들리지 않게)."""
+    text = (ROOT / "config" / "trading.json").read_text(encoding="utf-8")
+    replaced, count = MARKETS_LINE.subn(r'\1["KRW-BTC", "KRW-ETH", "KRW-SOL"]\2', text)
+    assert count == 1, "markets line not found in config/trading.json"
+    return replaced
+
 
 pytestmark = pytest.mark.skipif(
     any(shutil.which(tool) is None for tool in ("bash", "flock")), reason="bash, flock 필요"
@@ -53,7 +64,7 @@ class Server:
         (self.repo / "scripts").mkdir(parents=True)
         (self.repo / "config").mkdir()
         shutil.copy(SCRIPT, self.repo / "scripts" / "watchdog.sh")
-        shutil.copy(ROOT / "config" / "trading.json", self.repo / "config" / "trading.json")
+        (self.repo / "config" / "trading.json").write_text(_config_with_three_markets(), encoding="utf-8")
         (self.repo / ".env").write_text(f"DB_NAME=x\nDISCORD_WEBHOOK_URL={WEBHOOK}\n", encoding="utf-8")
         bin_dir = tmp_path / "bin"
         bin_dir.mkdir()
@@ -108,6 +119,18 @@ def test_healthy_sends_nothing(server: Server) -> None:
     # 설정의 마켓으로 DB를 조회한다
     query = next(call for call in server.docker_calls() if call.startswith("compose exec"))
     assert query.endswith("sh KRW-BTC,KRW-ETH,KRW-SOL")
+
+
+def test_reads_markets_from_repository_config(server: Server) -> None:
+    # 서버의 실제 설정 파일 형식에서도 마켓을 모두 읽는다
+    shutil.copy(ROOT / "config" / "trading.json", server.repo / "config" / "trading.json")
+    markets = json.loads((ROOT / "config" / "trading.json").read_text(encoding="utf-8"))["markets"]
+
+    server.run(FAKE_ROWS="\n".join(f"{market}|35" for market in markets))
+
+    query = next(call for call in server.docker_calls() if call.startswith("compose exec"))
+    assert query.endswith("sh " + ",".join(markets))
+    assert server.sent() == []
 
 
 def test_container_down_once_is_ignored_twice_alerts(server: Server) -> None:
