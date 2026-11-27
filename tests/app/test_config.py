@@ -272,13 +272,13 @@ def test_add_buy_units_needs_a_buy() -> None:
 
 
 def test_repository_config_order() -> None:
-    # 매수는 원화 잔고의 20%, 추가 매수는 첫 매수 금액의 1.5배로 최대 2번
+    # 매수는 원화 잔고의 20%, 추가 매수는 직전 매수 금액의 1.5배로 최대 2번 (첫 매수의 1.5배, 2.25배)
     order = load_config(REPO_CONFIG).order
     assert (order.buy_ratio, order.add_buy_multiple, order.max_add_buys, order.add_buy_base) == (
         Decimal("20"),
         Decimal("1.5"),
         2,
-        AddBuyBase.FIRST,
+        AddBuyBase.PREVIOUS,
     )
 
 
