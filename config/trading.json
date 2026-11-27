@@ -17,6 +17,7 @@
     "buy_ratio": 20.0,
     "add_buy_multiple": 1.5,
     "max_add_buys": 2,
+    "add_buy_base": "previous",
     "add_buy_trigger": "loss_relaxed",
     "stop_loss_after_adds": true,
     "stop_loss_by": "macd_dead_cross"
